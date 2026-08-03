@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "sanshain-rs",
+    "cargo-sanshain",
+]
+resolver = "2"
