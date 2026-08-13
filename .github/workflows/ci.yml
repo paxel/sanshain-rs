@@ -1,0 +1,43 @@
+# Gate for every push and pull request: formatting, clippy with zero warnings,
+# and the whole workspace test suite.
+#
+# Built against `stable` rather than a pinned toolchain, deliberately: this is a
+# published library, so the useful signal is whether it still compiles for the
+# toolchain consumers actually run. The floor consumers may rely on is the
+# `rust-version` in the workspace manifest.
+name: CI
+
+# Push covers the working branches; pull_request covers forks. A push that also
+# belongs to an open same-repo PR would run twice — the concurrency group below
+# collapses that.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+concurrency:
+  # head_ref (the branch) for PR events, ref for pushes — so a push to a branch
+  # with an open PR shares one group and the duplicate run is cancelled instead
+  # of building the same commit twice.
+  group: ci-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gate:
+    name: Gate (fmt, clippy, tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Tests
+        run: cargo test --workspace --locked

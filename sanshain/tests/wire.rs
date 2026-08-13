@@ -2,7 +2,7 @@
 //! actually sends (stability, version, no branch-era fields) and how failures
 //! (409, 404, 410, pre-2.0 server) are surfaced.
 
-use sanshain_rs::{ApiType, Client, Endpoint, Error, ProvideEntry, RequireEntry, Stability};
+use sanshain::{ApiType, Client, Endpoint, Error, ProvideEntry, RequireEntry, Stability};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -126,7 +126,11 @@ fn spec_entry(name: &str, api_type: ApiType) -> ProvideEntry {
     if let Err(err) = std::fs::write(&file, content) {
         panic!("failed to write spec file: {err}");
     }
-    ProvideEntry { file, api_type }
+    ProvideEntry {
+        file,
+        api_type,
+        retired: false,
+    }
 }
 
 fn require_entry(name: &str, endpoints: Vec<Endpoint>) -> RequireEntry {
@@ -168,9 +172,11 @@ fn provide_sends_stability_and_no_branch_era_fields() {
     };
     assert_eq!(payload["producername"], "demo-service");
     assert_eq!(payload["stability"], "snapshot");
-    assert!(payload["openapi_yaml"]
-        .as_str()
-        .is_some_and(|yaml| yaml.contains("version: 1.4.0")));
+    assert!(
+        payload["openapi_yaml"]
+            .as_str()
+            .is_some_and(|yaml| yaml.contains("version: 1.4.0"))
+    );
     for gone in ["branch", "base_version", "force", "author"] {
         assert!(
             payload.get(gone).is_none(),
@@ -331,7 +337,9 @@ fn pre_2_server_is_diagnosed_lazily() {
     match &err {
         Error::WrongServer(message) => assert_eq!(
             message,
-            &format!("Sanshain server at {url} is 1.7.3; this client requires Sanshain 2.x — upgrade the server.")
+            &format!(
+                "Sanshain server at {url} is 1.7.3; this client requires Sanshain 2.x — upgrade the server."
+            )
         ),
         other => panic!("expected a wrong-server diagnosis, got {other:?}"),
     }

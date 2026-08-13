@@ -1,0 +1,90 @@
+# Release on tag: `git tag v2.0.0 && git push origin v2.0.0` produces everything.
+#
+#   gate            — the full gate once more, plus tag/version agreement
+#   release         — the GitHub Release
+#   publish-crates  — crates.io, library before subcommand
+#
+# `cargo-sanshain` is a cargo subcommand, so anyone who can run it already has
+# cargo: crates.io is the whole distribution story and there are no prebuilt
+# binaries, taps or buckets to maintain.
+#
+# One-time setup (repository secret):
+#   CARGO_REGISTRY_TOKEN — crates.io API token with publish scope
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  # Releasing from the Actions UI: Run workflow → type the tag. RELEASE_TAG
+  # resolves to the typed tag or the pushed one, and the same pipeline runs
+  # either way.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v2.1.0)"
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  gate:
+    name: Gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # The mistake a hand-cut tag makes: tagging v2.1.0 without bumping the
+      # manifest. crates.io publishes what the manifest says, so the tag would
+      # name a version nobody can install.
+      - name: Tag matches the crate version
+        run: |
+          ver=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          tag=${RELEASE_TAG#v}
+          [ "$ver" = "$tag" ] || { echo "tag v$tag != workspace version $ver" >&2; exit 1; }
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+
+  release:
+    name: GitHub Release
+    needs: gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          generate_release_notes: true
+
+  publish-crates:
+    name: crates.io (sanshain → cargo-sanshain)
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Publish in dependency order (skipping versions already on the index)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          ver=${RELEASE_TAG#v}
+          publish() {
+            # A crates.io version is immutable — republishing is a hard error,
+            # so a re-run after a partial publish must skip what already landed.
+            # Cargo waits for the index itself, so no sleep is needed between.
+            if curl -fsSL -A "sanshain-rs-release-workflow" \
+                 "https://crates.io/api/v1/crates/$1/${ver}" >/dev/null 2>&1; then
+              echo "$1 ${ver} already on crates.io — skipping"
+            else
+              cargo publish --locked -p "$1"
+            fi
+          }
+          publish sanshain
+          publish cargo-sanshain

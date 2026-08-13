@@ -1,6 +1,19 @@
 [workspace]
 members = [
-    "sanshain-rs",
+    "sanshain",
     "cargo-sanshain",
 ]
 resolver = "2"
+
+# Shared so the library and the subcommand cannot drift apart on facts that
+# describe the same release of the same project.
+[workspace.package]
+version = "2.0.0"
+edition = "2024"
+# Edition 2024 requires 1.85. Declared rather than left implicit: this is a
+# published library, so the floor is a promise to consumers, not an internal
+# detail that can move quietly.
+rust-version = "1.85"
+authors = ["Patrick Zimmer"]
+license = "Apache-2.0"
+repository = "https://github.com/paxel/sanshain-rs"

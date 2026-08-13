@@ -2,15 +2,18 @@
 //! (OpenAPI, AsyncAPI, gRPC/Proto) under a producer-declared version, and
 //! **require** pinned endpoint snippets.
 //!
-//! Compatibility: **sanshain-rs 2.x speaks Sanshain Service 2.x.**
+//! Compatibility: **sanshain 2.x speaks Sanshain Service 2.x.**
+//!
+//! Configuration lives in `sanshain.yaml`, the same file every other Sanshain
+//! client reads.
 //!
 //! The spec version is never configured here — it lives in the spec file itself
-//! (`info.version` for OpenAPI/AsyncAPI, a `// sanshain-version: MAJOR.MINOR.PATCH`
-//! comment for proto). Every provide declares a stability: `snapshot` by default,
-//! `ga` only via the explicit switch (`SANSHAIN_GA=true` or the CLI's `--ga`).
+//! (`info.version` for OpenAPI/AsyncAPI, a `// sanshain-version:` comment for
+//! proto). Every provide declares a stability: `snapshot` by default, `ga` only
+//! via the explicit switch (`SANSHAIN_GA=true` or the CLI's `--ga`).
 
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -21,6 +24,13 @@ pub const GA_ENV_VAR: &str = "SANSHAIN_GA";
 pub const URL_ENV_VAR: &str = "SANSHAIN_URL";
 /// Environment variable carrying the API token (sent as `Authorization: Bearer`).
 pub const TOKEN_ENV_VAR: &str = "SANSHAIN_TOKEN";
+/// Environment variable declaring this build as the trunk stream's (`true` or `1`).
+pub const TRUNK_ENV_VAR: &str = "SANSHAIN_TRUNK";
+/// Environment variable naming the sanshain-branch this build belongs to.
+pub const TAG_ENV_VAR: &str = "SANSHAIN_TAG";
+
+/// The default configuration file name, in the project root.
+pub const CONFIG_FILE: &str = "sanshain.yaml";
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -78,6 +88,123 @@ pub fn resolve_stability_with(ga_flag: bool, ga_env: Option<&str>) -> Stability 
         Stability::Ga
     } else {
         Stability::Snapshot
+    }
+}
+
+/// Which dependency graph a build's calls belong to: trunk, a named
+/// sanshain-branch, or neither.
+///
+/// The stream is a property of the invocation, not of the repository, so it is
+/// declared by the pipeline (`--trunk` / [`TRUNK_ENV_VAR`], `--tag` /
+/// [`TAG_ENV_VAR`]) rather than committed to `sanshain.yaml`. A developer's
+/// laptop and the trunk CI job build the same checkout, and the trunk pin store
+/// is last-writer-wins — inferring the stream would let a local build overwrite
+/// what CI recorded.
+///
+/// Trunk and a tag are mutually exclusive (the server answers `400` for a call
+/// carrying both), so this type cannot hold both.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Stream {
+    /// The build speaks for no graph — the default.
+    #[default]
+    None,
+    /// The build maintains the main graph.
+    Trunk,
+    /// The build updates one sanshain-branch's graph.
+    Tag(String),
+}
+
+impl Stream {
+    /// The stream declared by a pipeline, preferring an explicit flag over the
+    /// environment.
+    ///
+    /// Reads [`TRUNK_ENV_VAR`] and [`TAG_ENV_VAR`]; see [`Stream::resolve_with`]
+    /// for the testable form.
+    pub fn resolve(trunk_flag: bool, tag: Option<&str>) -> Result<Stream> {
+        Stream::resolve_with(
+            trunk_flag,
+            tag,
+            std::env::var(TRUNK_ENV_VAR).ok().as_deref(),
+            std::env::var(TAG_ENV_VAR).ok().as_deref(),
+        )
+    }
+
+    /// [`Stream::resolve`] with the environment values passed in.
+    ///
+    /// A build declaring both trunk and a tag is a misconfiguration worth
+    /// naming here rather than spending a round trip to hear `400`.
+    pub fn resolve_with(
+        trunk_flag: bool,
+        tag: Option<&str>,
+        trunk_env: Option<&str>,
+        tag_env: Option<&str>,
+    ) -> Result<Stream> {
+        let is_true = |v: &str| v.eq_ignore_ascii_case("true") || v == "1";
+        let trunk = trunk_flag || trunk_env.is_some_and(is_true);
+        let tag = tag
+            .or(tag_env)
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string);
+
+        match (trunk, tag) {
+            (true, Some(tag)) => Err(Error::Config(format!(
+                "this build declares both trunk and tag '{tag}' — a build belongs to the trunk \
+                 stream or to one sanshain-branch, never both; set only one of --trunk / \
+                 {TRUNK_ENV_VAR} and --tag / {TAG_ENV_VAR}"
+            ))),
+            (true, None) => Ok(Stream::Trunk),
+            (false, Some(tag)) => Ok(Stream::Tag(tag)),
+            (false, None) => Ok(Stream::None),
+        }
+    }
+
+    /// The sanshain-branch this build belongs to, if any.
+    pub fn tag(&self) -> Option<&str> {
+        match self {
+            Stream::Tag(tag) => Some(tag),
+            _ => None,
+        }
+    }
+
+    /// Whether this build speaks for the trunk stream.
+    pub fn is_trunk(&self) -> bool {
+        matches!(self, Stream::Trunk)
+    }
+
+    /// The stream as require query parameters — empty when nothing is declared,
+    /// since the server defaults `trunk` to false and treats an absent `tag` as
+    /// "no branch".
+    fn query_params(&self) -> Vec<(&'static str, &str)> {
+        match self {
+            Stream::None => Vec::new(),
+            Stream::Trunk => vec![("trunk", "true")],
+            Stream::Tag(tag) => vec![("tag", tag.as_str())],
+        }
+    }
+
+    /// Adds the stream to a provide payload. Absent fields rather than explicit
+    /// nulls: the payload denies unknown shapes and defaults these itself.
+    fn apply_to_payload(&self, map: &mut serde_json::Map<String, Value>) {
+        match self {
+            Stream::None => {}
+            Stream::Trunk => {
+                map.insert("trunk".to_string(), Value::Bool(true));
+            }
+            Stream::Tag(tag) => {
+                map.insert("tag".to_string(), Value::String(tag.clone()));
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for Stream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Stream::None => f.write_str("none"),
+            Stream::Trunk => f.write_str("trunk"),
+            Stream::Tag(tag) => write!(f, "branch '{tag}'"),
+        }
     }
 }
 
@@ -154,6 +281,15 @@ pub struct ProvideEntry {
     pub file: PathBuf,
     #[serde(default)]
     pub api_type: ApiType,
+    /// This project no longer provides the family — retire the capability
+    /// instead of publishing.
+    ///
+    /// Deleting the entry would say nothing: Sanshain cannot tell a dropped
+    /// protocol from a pipeline that merely stopped running, so absence leaves
+    /// the capability, graph edges and contracts in place. Keeping the entry and
+    /// marking it retired is the explicit act. See [`Client::retire`].
+    #[serde(default)]
+    pub retired: bool,
 }
 
 /// One endpoint/channel/RPC of a requires entry.
@@ -224,7 +360,7 @@ const REMOVED_FIELDS: &[(&str, &str)] = &[
     ),
     (
         "stability",
-        "'stability' is not configured in the manifest — snapshot is the default; publish GA explicitly via SANSHAIN_GA=true or --ga",
+        "'stability' is not configured in sanshain.yaml — snapshot is the default; publish GA explicitly via SANSHAIN_GA=true or --ga",
     ),
     (
         "spec_id",
@@ -232,7 +368,7 @@ const REMOVED_FIELDS: &[(&str, &str)] = &[
     ),
     (
         "api_key",
-        "'api_key' is no longer supported — pass the token via the SANSHAIN_TOKEN environment variable; secrets do not belong in the manifest",
+        "'api_key' is no longer supported — pass the token via the SANSHAIN_TOKEN environment variable; secrets do not belong in sanshain.yaml",
     ),
     (
         "service_url",
@@ -253,39 +389,48 @@ fn check_removed_fields(obj: &serde_json::Map<String, Value>, context: &str) -> 
     Ok(())
 }
 
-fn is_strict_semver(version: &str) -> bool {
+/// Whether a pin is a version the server will accept: `MAJOR[.MINOR[.PATCH]]`,
+/// optionally `v`-prefixed.
+///
+/// Deliberately does not normalize. The server canonicalizes to three parts and
+/// answers with the canonical form; a second normalizer here could only ever
+/// disagree with it about what `v2.1` means.
+fn is_pinnable_version(version: &str) -> bool {
+    let version = version.strip_prefix('v').unwrap_or(version);
     let parts: Vec<&str> = version.split('.').collect();
-    parts.len() == 3
+    (1..=3).contains(&parts.len())
         && parts
             .iter()
             .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
 }
 
 impl Config {
-    /// Loads configuration from `[package.metadata.sanshain]` in `Cargo.toml`.
-    pub fn from_manifest() -> Result<Self> {
-        let metadata = cargo_metadata::MetadataCommand::new()
-            .exec()
-            .map_err(|e| Error::Config(format!("failed to execute cargo metadata: {e}")))?;
-
-        let package = metadata
-            .root_package()
-            .ok_or_else(|| Error::Config("no root package found".to_string()))?;
-
-        let sanshain_meta = package.metadata.get("sanshain").ok_or_else(|| {
-            Error::Config("missing [package.metadata.sanshain] in Cargo.toml".to_string())
+    /// Loads configuration from a `sanshain.yaml` file.
+    pub fn from_yaml_file(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let text = fs::read_to_string(path).map_err(|e| {
+            Error::Config(format!(
+                "cannot read {}: {e} — every Sanshain client reads its configuration from {CONFIG_FILE} in the project root",
+                path.display()
+            ))
         })?;
+        Self::from_yaml_str(&text)
+    }
 
-        Self::from_value(sanshain_meta)
+    /// Parses and validates a `sanshain.yaml` document.
+    pub fn from_yaml_str(yaml: &str) -> Result<Self> {
+        let value: Value = serde_yaml_ng::from_str(yaml)
+            .map_err(|e| Error::Config(format!("invalid {CONFIG_FILE}: {e}")))?;
+        Self::from_value(&value)
     }
 
     /// Parses and validates a configuration value. All validation happens here,
     /// before any network call: a requires entry without `version` and every
     /// leftover pre-2.0 field are hard errors carrying a migration hint.
     pub fn from_value(value: &Value) -> Result<Self> {
-        let obj = value.as_object().ok_or_else(|| {
-            Error::Config("[package.metadata.sanshain] must be a table".to_string())
-        })?;
+        let obj = value
+            .as_object()
+            .ok_or_else(|| Error::Config("sanshain.yaml must be a mapping".to_string()))?;
         check_removed_fields(obj, "")?;
 
         let mut provide_scopes: Vec<(String, &Value)> = Vec::new();
@@ -322,9 +467,9 @@ impl Config {
                     }
                     Some(version) => {
                         let version = version.as_str().unwrap_or("");
-                        if !is_strict_semver(version) {
+                        if !is_pinnable_version(version) {
                             return Err(Error::Config(format!(
-                                "{context}: version '{version}' is not exact MAJOR.MINOR.PATCH — Sanshain 2.0 pins exact versions (no ranges, no 'latest')"
+                                "{context}: version '{version}' is not a version — pin MAJOR[.MINOR[.PATCH]], optionally v-prefixed (no ranges, no 'latest')"
                             )));
                         }
                     }
@@ -341,7 +486,7 @@ impl Config {
         }
 
         let raw: RawConfig = serde_json::from_value(value.clone())
-            .map_err(|e| Error::Config(format!("invalid [package.metadata.sanshain]: {e}")))?;
+            .map_err(|e| Error::Config(format!("invalid {CONFIG_FILE}: {e}")))?;
         let service_name = raw.service_name.ok_or_else(|| {
             Error::Config(
                 "missing 'serviceName' — the name this project provides and requires as"
@@ -371,7 +516,7 @@ pub fn resolve_url(config_url: Option<&str>, env_url: Option<&str>) -> Result<St
         .filter(|u| !u.is_empty())
         .ok_or_else(|| {
             Error::Config(
-                "missing 'sanshainUrl' — set it in [package.metadata.sanshain] or via the SANSHAIN_URL environment variable"
+                "missing 'sanshainUrl' — set it in sanshain.yaml or via the SANSHAIN_URL environment variable"
                     .to_string(),
             )
         })
@@ -380,7 +525,7 @@ pub fn resolve_url(config_url: Option<&str>, env_url: Option<&str>) -> Result<St
 /// The error body every failure response carries; `proposed_version` appears
 /// only on a 409 refusing a provide by the version rules.
 #[derive(Debug, Clone, Deserialize)]
-pub struct ErrorBody {
+pub(crate) struct ErrorBody {
     pub error: String,
     pub proposed_version: Option<String>,
 }
@@ -392,6 +537,11 @@ pub struct ProvideResponse {
     pub stability: String,
     pub content_hash: String,
     pub changes: Changes,
+    /// AsyncAPI `subscribe` operations harvested from this document as
+    /// version-less consumer edges. Present only for AsyncAPI provides that
+    /// declared any.
+    #[serde(default)]
+    pub harvested_subscriptions: Vec<HarvestedSubscription>,
 }
 
 /// Endpoint diff relative to what this exact version stored before.
@@ -402,13 +552,81 @@ pub struct Changes {
     pub deletes: i64,
 }
 
-/// Builds the JSON payload for a provide call. Carries `stability`; the 1.x
-/// fields (`branch`, `base_version`, `force`) no longer exist.
-pub fn provide_payload(
+/// One AsyncAPI `subscribe` operation harvested from a provide.
+///
+/// Each is checked against the publishing Producer's GA channel contract.
+/// Reading fewer fields than the contract offers is fine; expecting a field the
+/// contract does not guarantee is drift — reported here on a snapshot, refused
+/// with `409` on a GA provide.
+#[derive(Debug, Clone, Deserialize)]
+pub struct HarvestedSubscription {
+    pub channel: String,
+    pub message_name: String,
+    /// The Producer owning the channel's PUB contract, absent while none does.
+    #[serde(default)]
+    pub owner: Option<String>,
+    /// Why the expectation is not satisfiable by the current contract.
+    #[serde(default)]
+    pub drift: Option<String>,
+}
+
+impl HarvestedSubscription {
+    /// Whether this line deserves a warning rather than an informational note —
+    /// drift against the contract, or no publisher at all.
+    pub fn is_advisory(&self) -> bool {
+        self.drift.is_some() || self.owner.is_none()
+    }
+}
+
+impl std::fmt::Display for HarvestedSubscription {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} / {}", self.channel, self.message_name)?;
+        match &self.owner {
+            Some(owner) => write!(f, " <- {owner}")?,
+            None => f.write_str(" <- (no publisher yet)")?,
+        }
+        if let Some(drift) = &self.drift {
+            write!(f, " — {drift}")?;
+        }
+        Ok(())
+    }
+}
+
+/// What retiring an API family shed. A retire publishes no version, so it
+/// reports none; all counts are zero for a dry run.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RetiredProtocol {
+    /// The capability tag removed (`messaging`/`grpc`), absent for OpenAPI.
+    #[serde(default)]
+    pub tag_cleared: Option<String>,
+    /// Open trunk pins closed — they leave the current main graph, their closed
+    /// rows stay as timeline history.
+    pub trunk_pins_closed: i64,
+    /// AsyncAPI channel-message contracts released for another Producer to claim.
+    pub contracts_released: i64,
+}
+
+/// Sanshain compares provided content byte for byte, so a CRLF checkout of an
+/// otherwise identical file hashes differently from an LF one and provokes a
+/// spurious version conflict. Normalising before upload means a Windows and a
+/// Linux runner publishing the same commit agree.
+fn normalize_line_endings(content: &str) -> String {
+    if content.contains('\r') {
+        content.replace("\r\n", "\n").replace('\r', "\n")
+    } else {
+        content.to_string()
+    }
+}
+
+/// Builds the JSON payload for a provide call. Carries `stability` and the
+/// declared stream; the 1.x fields (`branch`, `base_version`, `force`) no longer
+/// exist.
+pub(crate) fn provide_payload(
     producername: &str,
     api_type: ApiType,
     spec_content: &str,
     stability: Stability,
+    stream: &Stream,
 ) -> Value {
     let mut map = serde_json::Map::new();
     map.insert(
@@ -417,33 +635,47 @@ pub fn provide_payload(
     );
     map.insert(
         api_type.payload_key().to_string(),
-        Value::String(spec_content.to_string()),
+        Value::String(normalize_line_endings(spec_content)),
     );
     map.insert(
         "stability".to_string(),
         Value::String(stability.as_str().to_string()),
     );
+    stream.apply_to_payload(&mut map);
     Value::Object(map)
+}
+
+/// Builds the JSON payload for a retire.
+///
+/// A retire carries no document and no stability, and belongs to no stream — the
+/// server answers `400` for a request combining `retired` with any of them, so
+/// this payload has no field that could express one.
+pub(crate) fn retire_payload(producername: &str) -> Value {
+    json!({ "producername": producername, "retired": true })
 }
 
 /// Builds the query parameters for a single-endpoint require call. Carries the
 /// exact pinned `version`; the 1.x fields (`branch`, `timeout`, …) no longer exist.
-pub fn require_query<'a>(
+pub(crate) fn require_query<'a>(
     consumername: &'a str,
     entry: &'a RequireEntry,
     endpoint: &'a Endpoint,
+    stream: &'a Stream,
 ) -> Vec<(&'static str, &'a str)> {
-    vec![
+    let mut params = vec![
         ("consumername", consumername),
         ("producername", entry.service_name.as_str()),
         ("version", entry.version.as_str()),
         ("path", endpoint.path.as_str()),
         ("method", endpoint.method.as_str()),
-    ]
+    ];
+    params.extend(stream.query_params());
+    params
 }
 
-/// Builds the JSON payload for a `POST /require-bundle` call.
-pub fn require_bundle_payload(consumername: &str, entry: &RequireEntry) -> Value {
+/// Builds the JSON payload for a `POST /require-bundle` call. The stream rides
+/// the query string on this endpoint too, so it is not part of the body.
+pub(crate) fn require_bundle_payload(consumername: &str, entry: &RequireEntry) -> Value {
     json!({
         "consumername": consumername,
         "producername": entry.service_name,
@@ -469,7 +701,7 @@ fn fallback_message(body: &str) -> String {
 /// Formats a failed provide. A 409 surfaces the server's message and the
 /// `proposed_version` — the fix is always a version bump in your own spec file;
 /// the client never modifies it.
-pub fn provide_error_message(
+pub(crate) fn provide_error_message(
     status: u16,
     body: &str,
     api_type: ApiType,
@@ -493,14 +725,36 @@ pub fn provide_error_message(
         }
         400 => format!("provide rejected (400, invalid document): {server_message}"),
         422 => format!("provide rejected (422, wrong request shape): {server_message}"),
+        // Releasing is a permission, not merely an authenticated act, and the
+        // remedy is a role grant — nothing the Producer can change in its own
+        // repository. Naming it is the whole value of catching this status.
+        403 => format!(
+            "provide refused (403): {server_message}\nPublishing a GA version requires the 'releaser' role. Grant it to the user or token this build authenticates as (administrators and root always hold it), or publish as a snapshot by leaving --ga / {GA_ENV_VAR} unset."
+        ),
         _ => format!("provide failed ({status}): {server_message}"),
+    }
+}
+
+/// Formats a failed retire. Retiring is gated like releasing, but reachable two
+/// ways, so the refusal names both.
+pub(crate) fn retire_error_message(status: u16, body: &str, producername: &str) -> String {
+    let parsed: Option<ErrorBody> = serde_json::from_str(body).ok();
+    let server_message = parsed.map_or_else(|| fallback_message(body), |b| b.error);
+    match status {
+        403 => format!(
+            "retire refused (403): {server_message}\nRetiring an API family requires the 'releaser' role — which a release pipeline already holds — or a maintainer grant on '{producername}'. Administrators and root hold both."
+        ),
+        404 => format!(
+            "retire failed (404): {server_message}\nNothing was ever provided as '{producername}', so there is no family to retire."
+        ),
+        _ => format!("retire failed ({status}): {server_message}"),
     }
 }
 
 /// Formats a failed require, keeping the two failure modes distinct:
 /// 404 = the producer or pinned version is unknown (a config error, fix the pin);
 /// 410 = the version exists but deliberately lacks the endpoint(s).
-pub fn require_error_message(
+pub(crate) fn require_error_message(
     status: u16,
     body: &str,
     entry: &RequireEntry,
@@ -523,7 +777,7 @@ pub fn require_error_message(
 
 /// If the reported instance version is pre-2.0, the message that replaces the
 /// original (confusing) error.
-pub fn wrong_server_message(base_url: &str, reported: &str) -> Option<String> {
+pub(crate) fn wrong_server_message(base_url: &str, reported: &str) -> Option<String> {
     let major: u64 = reported.split('.').next()?.trim().parse().ok()?;
     (major < 2).then(|| {
         format!(
@@ -536,14 +790,35 @@ pub fn wrong_server_message(base_url: &str, reported: &str) -> Option<String> {
 pub struct Client {
     base_url: String,
     token: Option<String>,
+    stream: Stream,
 }
 
 impl Client {
     /// Creates a client for the given base URL; `token` is sent as
-    /// `Authorization: Bearer` when present.
+    /// `Authorization: Bearer` when present. The stream defaults to
+    /// [`Stream::None`] — see [`Client::with_stream`].
     pub fn new(base_url: impl Into<String>, token: Option<String>) -> Self {
         let base_url = base_url.into().trim_end_matches('/').to_string();
-        Self { base_url, token }
+        Self {
+            base_url,
+            token,
+            stream: Stream::None,
+        }
+    }
+
+    /// Declares which graph this build's calls belong to.
+    ///
+    /// Set once for the whole run rather than per call: the stream is a property
+    /// of the invocation, unlike `stability`, which genuinely varies between one
+    /// provide and the next.
+    pub fn with_stream(mut self, stream: Stream) -> Self {
+        self.stream = stream;
+        self
+    }
+
+    /// The stream this client declares on every call.
+    pub fn stream(&self) -> &Stream {
+        &self.stream
     }
 
     /// Creates a client from the configuration plus the `SANSHAIN_URL` /
@@ -572,12 +847,42 @@ impl Client {
         stability: Stability,
     ) -> Result<ProvideResponse> {
         let content = fs::read_to_string(&entry.file)?;
-        let payload = provide_payload(producername, entry.api_type, &content, stability);
+        let payload = provide_payload(
+            producername,
+            entry.api_type,
+            &content,
+            stability,
+            &self.stream,
+        );
         let url = format!("{}{}", self.base_url, entry.api_type.provide_path());
         match self.with_auth(ureq::post(&url)).send_json(payload) {
             Ok(response) => Ok(response.into_json()?),
             Err(err) => Err(self.map_failure(err, |status, body| {
                 provide_error_message(status, body, entry.api_type, &entry.file)
+            })),
+        }
+    }
+
+    /// Declares that this Producer no longer provides an API family.
+    ///
+    /// The call is an ordinary provide for that family carrying `retired: true`
+    /// and no document — the endpoint already names the family. The capability
+    /// tag is cleared, the family leaves the current dependency graph and its
+    /// AsyncAPI channel contracts are released; version history and existing
+    /// Consumer pins are untouched.
+    ///
+    /// Gated like releasing: the caller needs the `releaser` role — which a
+    /// release pipeline already holds — or a maintainer grant on this Producer,
+    /// or the server answers `403`.
+    pub fn retire(&self, producername: &str, api_type: ApiType) -> Result<RetiredProtocol> {
+        let url = format!("{}{}", self.base_url, api_type.provide_path());
+        match self
+            .with_auth(ureq::post(&url))
+            .send_json(retire_payload(producername))
+        {
+            Ok(response) => Ok(response.into_json()?),
+            Err(err) => Err(self.map_failure(err, |status, body| {
+                retire_error_message(status, body, producername)
             })),
         }
     }
@@ -589,14 +894,21 @@ impl Client {
         let result = if entry.endpoints.len() == 1 {
             let url = format!("{}{}", self.base_url, entry.api_type.require_path());
             let mut request = self.with_auth(ureq::get(&url));
-            for (key, value) in require_query(consumername, entry, &entry.endpoints[0]) {
+            for (key, value) in
+                require_query(consumername, entry, &entry.endpoints[0], &self.stream)
+            {
                 request = request.query(key, value);
             }
             request.call()
         } else {
             let url = format!("{}/require-bundle", self.base_url);
-            self.with_auth(ureq::post(&url))
-                .send_json(require_bundle_payload(consumername, entry))
+            let mut request = self.with_auth(ureq::post(&url));
+            // The bundle takes the stream on the query string, like the single
+            // require — only the endpoint list travels in the body.
+            for (key, value) in self.stream.query_params() {
+                request = request.query(key, value);
+            }
+            request.send_json(require_bundle_payload(consumername, entry))
         };
         match result {
             Ok(response) => {
@@ -642,20 +954,6 @@ impl Client {
         let reported = body.get("version")?.as_str()?;
         wrong_server_message(&self.base_url, reported)
     }
-}
-
-/// A high-level helper for `build.rs`: performs every configured require.
-pub fn sync_specs(config: &Config) -> Result<()> {
-    // Notify Cargo to rerun if config or environment changes.
-    println!("cargo:rerun-if-changed=Cargo.toml");
-    println!("cargo:rerun-if-env-changed={URL_ENV_VAR}");
-    println!("cargo:rerun-if-env-changed={TOKEN_ENV_VAR}");
-
-    let client = Client::from_config(config)?;
-    for entry in &config.requires {
-        client.require(&config.service_name, entry)?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -817,7 +1115,7 @@ mod tests {
         let message = config_error(&value);
         assert_eq!(
             message,
-            "provides[0]: 'stability' is not configured in the manifest — snapshot is the default; publish GA explicitly via SANSHAIN_GA=true or --ga"
+            "provides[0]: 'stability' is not configured in sanshain.yaml — snapshot is the default; publish GA explicitly via SANSHAIN_GA=true or --ga"
         );
     }
 
@@ -861,7 +1159,7 @@ mod tests {
         let message = config_error(&value);
         assert_eq!(
             message,
-            "requires[0] (user-service): version 'latest' is not exact MAJOR.MINOR.PATCH — Sanshain 2.0 pins exact versions (no ranges, no 'latest')"
+            "requires[0] (user-service): version 'latest' is not a version — pin MAJOR[.MINOR[.PATCH]], optionally v-prefixed (no ranges, no 'latest')"
         );
     }
 
@@ -925,6 +1223,7 @@ mod tests {
             ApiType::OpenApi,
             "openapi: 3.0.3",
             Stability::Snapshot,
+            &Stream::None,
         );
         assert_eq!(payload["producername"], "gateway-service");
         assert_eq!(payload["openapi_yaml"], "openapi: 3.0.3");
@@ -940,7 +1239,13 @@ mod tests {
 
     #[test]
     fn provide_payload_key_follows_api_type() {
-        let asyncapi = provide_payload("s", ApiType::AsyncApi, "asyncapi: 2.6.0", Stability::Ga);
+        let asyncapi = provide_payload(
+            "s",
+            ApiType::AsyncApi,
+            "asyncapi: 2.6.0",
+            Stability::Ga,
+            &Stream::None,
+        );
         assert_eq!(asyncapi["asyncapi_yaml"], "asyncapi: 2.6.0");
         assert_eq!(asyncapi["stability"], "ga");
         let proto = provide_payload(
@@ -948,6 +1253,7 @@ mod tests {
             ApiType::Proto,
             "syntax = \"proto3\";",
             Stability::Snapshot,
+            &Stream::None,
         );
         assert_eq!(proto["proto_content"], "syntax = \"proto3\";");
     }
@@ -955,7 +1261,12 @@ mod tests {
     #[test]
     fn require_query_carries_version_and_no_branch_era_params() {
         let entry = require_entry();
-        let query = require_query("gateway-service", &entry, &entry.endpoints[0]);
+        let query = require_query(
+            "gateway-service",
+            &entry,
+            &entry.endpoints[0],
+            &Stream::None,
+        );
         assert_eq!(
             query,
             vec![
@@ -1078,6 +1389,289 @@ mod tests {
             Err(Error::Config(message)) => {
                 assert!(message.contains("'sanshainUrl'"), "unexpected: {message}");
                 assert!(message.contains("SANSHAIN_URL"), "unexpected: {message}");
+            }
+            other => panic!("expected a configuration error, got {other:?}"),
+        }
+    }
+
+    // --- 2.2: streams, retire, harvested subscriptions, version leniency ---
+
+    #[test]
+    fn stream_defaults_to_none_and_prefers_the_flag_over_the_environment() {
+        assert_eq!(
+            Stream::resolve_with(false, None, None, None).ok(),
+            Some(Stream::None)
+        );
+        assert_eq!(
+            Stream::resolve_with(false, None, Some("true"), None).ok(),
+            Some(Stream::Trunk)
+        );
+        assert_eq!(
+            Stream::resolve_with(false, Some("from-flag"), None, Some("from-env")).ok(),
+            Some(Stream::Tag("from-flag".to_string()))
+        );
+        assert_eq!(
+            Stream::resolve_with(false, None, None, Some("R")).ok(),
+            Some(Stream::Tag("R".to_string()))
+        );
+        // A blank tag declares nothing rather than a branch named "".
+        assert_eq!(
+            Stream::resolve_with(false, Some("   "), None, None).ok(),
+            Some(Stream::None)
+        );
+    }
+
+    #[test]
+    fn declaring_both_trunk_and_tag_is_refused_locally() {
+        match Stream::resolve_with(true, Some("R"), None, None) {
+            Err(Error::Config(message)) => {
+                assert!(message.contains("never both"), "unexpected: {message}");
+                assert!(
+                    message.contains('R'),
+                    "the message names the tag: {message}"
+                );
+            }
+            other => panic!("expected a configuration error, got {other:?}"),
+        }
+        // The collision is caught across sources too, not only within one.
+        assert!(Stream::resolve_with(true, None, None, Some("R")).is_err());
+    }
+
+    #[test]
+    fn undeclared_stream_sends_no_fields_at_all() {
+        let payload = provide_payload(
+            "svc",
+            ApiType::OpenApi,
+            "openapi: 3.0.3",
+            Stability::Snapshot,
+            &Stream::None,
+        );
+        let keys: Vec<&str> = payload
+            .as_object()
+            .map(|o| o.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        assert!(!keys.contains(&"trunk"), "got: {keys:?}");
+        assert!(!keys.contains(&"tag"), "got: {keys:?}");
+        assert!(
+            require_query(
+                "c",
+                &require_entry(),
+                &require_entry().endpoints[0],
+                &Stream::None
+            )
+            .iter()
+            .all(|(k, _)| *k != "trunk" && *k != "tag")
+        );
+    }
+
+    #[test]
+    fn a_declared_stream_rides_the_payload_and_the_query() {
+        let trunk = provide_payload(
+            "svc",
+            ApiType::OpenApi,
+            "openapi: 3.0.3",
+            Stability::Snapshot,
+            &Stream::Trunk,
+        );
+        assert_eq!(trunk["trunk"], true);
+        let tagged = provide_payload(
+            "svc",
+            ApiType::OpenApi,
+            "openapi: 3.0.3",
+            Stability::Snapshot,
+            &Stream::Tag("Maribou".to_string()),
+        );
+        assert_eq!(tagged["tag"], "Maribou");
+
+        let entry = require_entry();
+        let query = require_query("c", &entry, &entry.endpoints[0], &Stream::Trunk);
+        assert!(query.contains(&("trunk", "true")), "got: {query:?}");
+        let branch = Stream::Tag("R".to_string());
+        let tagged = require_query("c", &entry, &entry.endpoints[0], &branch);
+        assert!(tagged.contains(&("tag", "R")), "got: {tagged:?}");
+    }
+
+    /// Content is compared byte for byte, so a CRLF checkout must hash the same
+    /// as an LF one — otherwise the same commit conflicts with itself depending
+    /// on which runner published it.
+    #[test]
+    fn provided_content_is_normalized_to_lf() {
+        let payload = provide_payload(
+            "svc",
+            ApiType::OpenApi,
+            "openapi: 3.0.3\r\ninfo:\r\n  title: T\r",
+            Stability::Snapshot,
+            &Stream::None,
+        );
+        assert_eq!(
+            payload["openapi_yaml"],
+            "openapi: 3.0.3\ninfo:\n  title: T\n"
+        );
+        assert_eq!(normalize_line_endings("a\nb\n"), "a\nb\n");
+    }
+
+    #[test]
+    fn a_retire_payload_cannot_carry_a_document_a_stability_or_a_stream() {
+        let payload = retire_payload("svc");
+        assert_eq!(payload["producername"], "svc");
+        assert_eq!(payload["retired"], true);
+        let keys: Vec<&str> = payload
+            .as_object()
+            .map(|o| o.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        assert_eq!(keys.len(), 2, "got: {keys:?}");
+    }
+
+    #[test]
+    fn version_pins_accept_short_and_v_prefixed_forms() {
+        for accepted in ["1.2.3", "v1.2.3", "2.1", "v2", "0.0.0"] {
+            assert!(is_pinnable_version(accepted), "should accept {accepted}");
+        }
+        for refused in ["latest", "", "1.2.3.4", "1..3", "v", "1.x", "^1.2.0"] {
+            assert!(!is_pinnable_version(refused), "should refuse {refused}");
+        }
+    }
+
+    #[test]
+    fn a_ga_refusal_names_the_releaser_role_and_the_snapshot_way_out() {
+        let message = provide_error_message(
+            403,
+            r#"{"error":"publishing GA for 'svc' requires the 'releaser' role"}"#,
+            ApiType::OpenApi,
+            Path::new("openapi.yaml"),
+        );
+        assert!(message.contains("releaser"), "unexpected: {message}");
+        assert!(message.contains("snapshot"), "unexpected: {message}");
+    }
+
+    #[test]
+    fn a_retire_refusal_names_both_ways_in() {
+        let message = retire_error_message(
+            403,
+            r#"{"error":"retiring requires the 'releaser' role"}"#,
+            "svc",
+        );
+        assert!(message.contains("releaser"), "unexpected: {message}");
+        assert!(message.contains("maintainer"), "unexpected: {message}");
+        let unknown =
+            retire_error_message(404, r#"{"error":"Producer 'ghost' not found"}"#, "ghost");
+        assert!(
+            unknown.contains("no family to retire"),
+            "unexpected: {unknown}"
+        );
+    }
+
+    #[test]
+    fn harvested_subscriptions_separate_advisories_from_resolved_edges() {
+        let response: ProvideResponse = serde_json::from_str(
+            r#"{"version":"1.0.0","stability":"snapshot","content_hash":"sha256:abc",
+                "changes":{"inserts":0,"updates":0,"deletes":0},
+                "harvested_subscriptions":[
+                  {"channel":"user/signup","message_name":"UserSignedUp","owner":"accounts"},
+                  {"channel":"order/placed","message_name":"OrderPlaced","drift":"expects 'total'"}]}"#,
+        )
+        .expect("response should parse");
+        assert_eq!(response.harvested_subscriptions.len(), 2);
+
+        let resolved = &response.harvested_subscriptions[0];
+        assert!(!resolved.is_advisory());
+        assert!(resolved.to_string().contains("accounts"));
+
+        let drifting = &response.harvested_subscriptions[1];
+        assert!(drifting.is_advisory(), "drift is an advisory");
+        assert!(drifting.to_string().contains("no publisher yet"));
+        assert!(drifting.to_string().contains("total"));
+    }
+
+    /// Absent for OpenAPI and for documents declaring none — never a parse error.
+    #[test]
+    fn a_response_without_harvested_subscriptions_still_parses() {
+        let response: ProvideResponse = serde_json::from_str(
+            r#"{"version":"1.0.0","stability":"ga","content_hash":"sha256:abc",
+                "changes":{"inserts":1,"updates":0,"deletes":0}}"#,
+        )
+        .expect("response should parse");
+        assert!(response.harvested_subscriptions.is_empty());
+    }
+
+    // --- sanshain.yaml ---
+
+    #[test]
+    fn config_loads_from_yaml_like_every_other_client() {
+        let config = Config::from_yaml_str(
+            r#"
+serviceName: order-service
+sanshainUrl: https://sanshain.example.com
+provides:
+  - file: api/openapi.yaml
+  - file: api/events.yaml
+    apiType: asyncapi
+requires:
+  - serviceName: user-service
+    version: v2.3
+    outputDirectory: target/generated/user-service
+    endpoints:
+      - method: GET
+        path: /api/v1/users
+"#,
+        )
+        .expect("config should parse");
+        assert_eq!(config.service_name, "order-service");
+        assert_eq!(
+            config.sanshain_url.as_deref(),
+            Some("https://sanshain.example.com")
+        );
+        assert_eq!(config.provides.len(), 2);
+        assert_eq!(config.provides[1].api_type, ApiType::AsyncApi);
+        // The short pin reaches the server verbatim; only it canonicalizes.
+        assert_eq!(config.requires[0].version, "v2.3");
+    }
+
+    #[test]
+    fn a_retired_entry_is_config_not_a_publish() {
+        let config = Config::from_yaml_str(
+            r#"
+serviceName: order-service
+sanshainUrl: http://localhost:8080
+provides:
+  - file: api/events.yaml
+    apiType: asyncapi
+    retired: true
+"#,
+        )
+        .expect("config should parse");
+        assert!(config.provides[0].retired);
+        assert_eq!(config.provides[0].api_type, ApiType::AsyncApi);
+    }
+
+    #[test]
+    fn branch_era_yaml_is_still_refused_by_name() {
+        let err = Config::from_yaml_str(
+            r#"
+serviceName: order-service
+sanshainUrl: http://localhost:8080
+requires:
+  - serviceName: user-service
+    branch: main
+    outputDirectory: out
+    endpoints:
+      - method: GET
+        path: /users
+"#,
+        );
+        match err {
+            Err(Error::Config(message)) => {
+                assert!(message.contains("'branch'"), "unexpected: {message}");
+            }
+            other => panic!("expected a configuration error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_yaml_names_the_file_it_could_not_read() {
+        match Config::from_yaml_str("serviceName: [unclosed") {
+            Err(Error::Config(message)) => {
+                assert!(message.contains(CONFIG_FILE), "unexpected: {message}");
             }
             other => panic!("expected a configuration error, got {other:?}"),
         }
