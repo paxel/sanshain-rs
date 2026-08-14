@@ -673,10 +673,16 @@ pub(crate) fn require_query<'a>(
     params
 }
 
-/// Builds the JSON payload for a `POST /require-bundle` call. The stream rides
-/// the query string on this endpoint too, so it is not part of the body.
-pub(crate) fn require_bundle_payload(consumername: &str, entry: &RequireEntry) -> Value {
-    json!({
+/// Builds the JSON payload for a `POST /require-bundle` call. Unlike the
+/// single-endpoint GET, this endpoint reads the stream from the body — the
+/// server's bundle handler has no query extractor, so query parameters would be
+/// silently ignored and a trunk build would record no trunk pins.
+pub(crate) fn require_bundle_payload(
+    consumername: &str,
+    entry: &RequireEntry,
+    stream: &Stream,
+) -> Value {
+    let mut payload = json!({
         "consumername": consumername,
         "producername": entry.service_name,
         "version": entry.version,
@@ -686,7 +692,11 @@ pub(crate) fn require_bundle_payload(consumername: &str, entry: &RequireEntry) -
             .iter()
             .map(|e| json!({ "path": e.path, "method": e.method }))
             .collect::<Vec<_>>(),
-    })
+    });
+    if let Some(map) = payload.as_object_mut() {
+        stream.apply_to_payload(map);
+    }
+    payload
 }
 
 fn fallback_message(body: &str) -> String {
@@ -902,13 +912,8 @@ impl Client {
             request.call()
         } else {
             let url = format!("{}/require-bundle", self.base_url);
-            let mut request = self.with_auth(ureq::post(&url));
-            // The bundle takes the stream on the query string, like the single
-            // require — only the endpoint list travels in the body.
-            for (key, value) in self.stream.query_params() {
-                request = request.query(key, value);
-            }
-            request.send_json(require_bundle_payload(consumername, entry))
+            self.with_auth(ureq::post(&url))
+                .send_json(require_bundle_payload(consumername, entry, &self.stream))
         };
         match result {
             Ok(response) => {
@@ -1298,13 +1303,27 @@ mod tests {
             method: "POST".to_string(),
             path: "/api/v1/users".to_string(),
         });
-        let payload = require_bundle_payload("gateway-service", &entry);
+        let payload = require_bundle_payload("gateway-service", &entry, &Stream::None);
         assert_eq!(payload["consumername"], "gateway-service");
         assert_eq!(payload["producername"], "user-service");
         assert_eq!(payload["version"], "2.3.0");
         assert_eq!(payload["api_type"], "openapi");
         assert_eq!(payload["endpoints"][1]["method"], "POST");
         assert_eq!(payload["endpoints"][1]["path"], "/api/v1/users");
+        assert!(payload.get("trunk").is_none());
+        assert!(payload.get("tag").is_none());
+    }
+
+    /// The bundle endpoint reads the stream from the body, not the query — the
+    /// server's handler has no query extractor, so a stream on the query string
+    /// would be silently dropped and a trunk build would record no trunk pins.
+    #[test]
+    fn require_bundle_payload_carries_the_stream_in_the_body() {
+        let entry = require_entry();
+        let trunk = require_bundle_payload("c", &entry, &Stream::Trunk);
+        assert_eq!(trunk["trunk"], true);
+        let tagged = require_bundle_payload("c", &entry, &Stream::Tag("R".to_string()));
+        assert_eq!(tagged["tag"], "R");
     }
 
     #[test]
