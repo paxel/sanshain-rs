@@ -67,6 +67,11 @@ requires:
   `timeout`, `baseVersion`, `releaseBranches`, `stability`, `spec_id`, `api_key`,
   `service_url`) are rejected by name with a migration hint.
 
+- A field no Sanshain client knows (a typo like `catalogInf` or `requires[0].verison`) is
+  collected in [`Config::unknown_fields`], in file order, after the rejections above. Fields
+  other clients know but this one does not use (`compression`, `insecure`, …) are accepted
+  silently. [`puzzled_cat`] formats the warning a command prints for them.
+
 Parsing is separate from loading: [`Config::from_value`] validates a `serde_json::Value`,
 so a caller holding configuration in another form can bypass the file entirely.
 

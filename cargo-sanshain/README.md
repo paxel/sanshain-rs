@@ -32,6 +32,18 @@ requires:
 Relative paths in it (`file`, `outputDirectory`) resolve against the directory containing
 `sanshain.yaml`, not the working directory.
 
+A field no Sanshain client knows is reported once per run on stderr, and the command
+carries on:
+
+```text
+   /\_/\  ?
+  ( O_o )   sanshain.yaml: unknown field 'catalogInf' - ignored
+ ---U-U---
+```
+
+Under strict mode the same cat ends in `rejected (strict)` and the command fails; best effort
+does not soften that.
+
 ## Commands
 
 ```console

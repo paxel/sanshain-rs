@@ -380,3 +380,43 @@ fn an_unloadable_config_is_a_warning_only_with_best_effort_from_flag_or_env() {
     assert_success(&output);
     assert!(stderr(&output).contains("Warning loading config"));
 }
+
+// --- the puzzled cat ---
+
+const CAT_IGNORED: &str = "   /\\_/\\  ?\n  ( O_o )   sanshain.yaml: unknown fields 'catalogInf', 'requires[0].verison' - ignored\n ---U-U---\n";
+
+const UNKNOWN_FIELDS_YAML: &str = "serviceName: demo-service\ncatalogInf: catalog-info.yaml\nrequires:\n  - serviceName: user-service\n    version: 1.2.0\n    verison: 1.2.0\n    outputDirectory: out\n    endpoints:\n      - method: GET\n        path: /x\n";
+
+#[test]
+fn unknown_fields_print_the_cat_once_and_carry_on() {
+    let dir = project("cat_ignored");
+    let (url, handle) = mock_server(vec![http_response("200 OK", "openapi: 3.0.3\n")]);
+    write(
+        &dir.join("sanshain.yaml"),
+        &format!("sanshainUrl: {url}\n{UNKNOWN_FIELDS_YAML}"),
+    );
+    let output = run(&dir, &["require"], &[]);
+    assert_success(&output);
+    let err = stderr(&output);
+    assert!(err.starts_with(CAT_IGNORED), "unexpected stderr: {err}");
+    assert_eq!(err.matches("O_o").count(), 1, "the cat appears once: {err}");
+    assert!(dir.join("out/user-service.yaml").exists());
+    drop(joined_requests(handle));
+}
+
+#[test]
+fn unknown_fields_fail_under_strict_even_with_best_effort() {
+    let dir = project("cat_strict");
+    write(&dir.join("sanshain.yaml"), UNKNOWN_FIELDS_YAML);
+    let output = run(
+        &dir,
+        &["require", "--best-effort"],
+        &[("SANSHAIN_STRICT", "true")],
+    );
+    assert_failure(&output);
+    let err = stderr(&output);
+    assert!(
+        err.contains("'catalogInf', 'requires[0].verison' - rejected (strict)\n ---U-U---"),
+        "unexpected stderr: {err}"
+    );
+}

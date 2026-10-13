@@ -352,6 +352,9 @@ pub struct Config {
     /// `bestEffort` from `sanshain.yaml`: failed calls become warnings. See
     /// [`BEST_EFFORT_ENV_VAR`].
     pub best_effort: bool,
+    /// Fields no Sanshain client knows, as paths in file order
+    /// (`provides[1].verison`). Parsing ignores them; see [`puzzled_cat`].
+    pub unknown_fields: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -413,6 +416,117 @@ const REMOVED_FIELDS: &[(&str, &str)] = &[
         "'service_url' is no longer supported — use 'sanshainUrl' (or the SANSHAIN_URL environment variable)",
     ),
 ];
+
+/// Every field any Sanshain client knows, per level. A field known here but not
+/// supported by this client (`compression`, `insecure`, …) is accepted silently.
+const KNOWN_TOP_FIELDS: &[&str] = &[
+    "sanshainUrl",
+    "serviceName",
+    "clientName",
+    "compression",
+    "bestEffort",
+    "strict",
+    "force",
+    "insecure",
+    "combine",
+    "catalogInfo",
+    "provide",
+    "provides",
+    "requires",
+];
+const KNOWN_PROVIDE_FIELDS: &[&str] = &[
+    "file",
+    "apiType",
+    "retired",
+    "openApiFile",
+    "asyncApiFile",
+    "protoFile",
+    "combine",
+];
+const KNOWN_REQUIRE_FIELDS: &[&str] = &[
+    "serviceName",
+    "apiType",
+    "version",
+    "outputDirectory",
+    "endpoints",
+];
+const KNOWN_ENDPOINT_FIELDS: &[&str] = &["method", "path"];
+
+/// Appends `prefix` + each key of `value` not in `known` to `out`, in order.
+fn collect_unknown(value: &Value, known: &[&str], prefix: &str, out: &mut Vec<String>) {
+    if let Some(obj) = value.as_object() {
+        for key in obj.keys() {
+            if !known.contains(&key.as_str()) {
+                out.push(format!("{prefix}{key}"));
+            }
+        }
+    }
+}
+
+/// Every unknown field of a configuration, as a path, in file order.
+fn unknown_fields(obj: &serde_json::Map<String, Value>) -> Vec<String> {
+    let mut out = Vec::new();
+    for (key, value) in obj {
+        match key.as_str() {
+            "provide" => collect_unknown(value, KNOWN_PROVIDE_FIELDS, "provide.", &mut out),
+            "provides" => {
+                for (i, entry) in value.as_array().into_iter().flatten().enumerate() {
+                    let prefix = format!("provides[{i}].");
+                    collect_unknown(entry, KNOWN_PROVIDE_FIELDS, &prefix, &mut out);
+                }
+            }
+            "requires" => {
+                for (i, entry) in value.as_array().into_iter().flatten().enumerate() {
+                    let Some(entry_obj) = entry.as_object() else {
+                        continue;
+                    };
+                    for (field, field_value) in entry_obj {
+                        if field == "endpoints" {
+                            for (j, endpoint) in
+                                field_value.as_array().into_iter().flatten().enumerate()
+                            {
+                                let prefix = format!("requires[{i}].endpoints[{j}].");
+                                collect_unknown(endpoint, KNOWN_ENDPOINT_FIELDS, &prefix, &mut out);
+                            }
+                        } else if !KNOWN_REQUIRE_FIELDS.contains(&field.as_str()) {
+                            out.push(format!("requires[{i}].{field}"));
+                        }
+                    }
+                }
+            }
+            other if !KNOWN_TOP_FIELDS.contains(&other) => out.push(other.to_string()),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The puzzled cat: what a command prints, once, when `sanshain.yaml` carries
+/// fields no Sanshain client knows. `None` when there are none. Under strict
+/// the fields are rejected and the command must fail after printing it.
+pub fn puzzled_cat(unknown_fields: &[String], strict: bool) -> Option<String> {
+    if unknown_fields.is_empty() {
+        return None;
+    }
+    let noun = if unknown_fields.len() == 1 {
+        "field"
+    } else {
+        "fields"
+    };
+    let names = unknown_fields
+        .iter()
+        .map(|f| format!("'{f}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let verdict = if strict {
+        "rejected (strict)"
+    } else {
+        "ignored"
+    };
+    Some(format!(
+        "   /\\_/\\  ?\n  ( O_o )   {CONFIG_FILE}: unknown {noun} {names} - {verdict}\n ---U-U---"
+    ))
+}
 
 fn check_removed_fields(obj: &serde_json::Map<String, Value>, context: &str) -> Result<()> {
     for (field, message) in REMOVED_FIELDS {
@@ -484,7 +598,8 @@ impl Config {
 
     /// Parses and validates a configuration value. All validation happens here,
     /// before any network call: a requires entry without `version` and every
-    /// leftover pre-2.0 field are hard errors carrying a migration hint.
+    /// leftover pre-2.0 field are hard errors carrying a migration hint. Any
+    /// other field no client knows is collected in [`Config::unknown_fields`].
     pub fn from_value(value: &Value) -> Result<Self> {
         let obj = value
             .as_object()
@@ -557,6 +672,7 @@ impl Config {
             requires: raw.requires,
             strict: raw.strict,
             best_effort: raw.best_effort,
+            unknown_fields: unknown_fields(obj),
         })
     }
 }
@@ -1262,6 +1378,136 @@ mod tests {
         );
         let both = Config::from_yaml_str("serviceName: s\nstrict: true\nbestEffort: true\n").ok();
         assert_eq!(both.map(|c| (c.strict, c.best_effort)), Some((true, true)));
+    }
+
+    fn unknown(yaml: &str) -> Vec<String> {
+        match Config::from_yaml_str(yaml) {
+            Ok(config) => config.unknown_fields,
+            Err(err) => panic!("expected the config to parse, got {err}"),
+        }
+    }
+
+    #[test]
+    fn a_single_unknown_field_gets_the_cat() {
+        let fields = unknown("serviceName: s\ncatalogInf: catalog-info.yaml\n");
+        assert_eq!(fields, vec!["catalogInf".to_string()]);
+        assert_eq!(
+            puzzled_cat(&fields, false).as_deref(),
+            Some(
+                "   /\\_/\\  ?\n  ( O_o )   sanshain.yaml: unknown field 'catalogInf' - ignored\n ---U-U---"
+            )
+        );
+    }
+
+    #[test]
+    fn several_unknown_fields_are_listed_in_file_order_with_their_paths() {
+        let fields = unknown(
+            r#"
+zebra: 1
+serviceName: s
+provide:
+  file: a.yaml
+  fiel: b.yaml
+provides:
+  - file: c.yaml
+  - file: d.yaml
+    verison: 1.0.0
+requires:
+  - serviceName: u
+    version: 1.0.0
+    outputDirectroy: out
+    outputDirectory: out
+    endpoints:
+      - method: GET
+        path: /a
+      - method: GET
+        path: /b
+      - methd: GET
+        method: GET
+        path: /c
+catalogInf: x
+"#,
+        );
+        assert_eq!(
+            fields,
+            vec![
+                "zebra",
+                "provide.fiel",
+                "provides[1].verison",
+                "requires[0].outputDirectroy",
+                "requires[0].endpoints[2].methd",
+                "catalogInf",
+            ]
+        );
+        assert_eq!(
+            puzzled_cat(&fields[..2], false).as_deref(),
+            Some(
+                "   /\\_/\\  ?\n  ( O_o )   sanshain.yaml: unknown fields 'zebra', 'provide.fiel' - ignored\n ---U-U---"
+            )
+        );
+    }
+
+    #[test]
+    fn under_strict_the_cat_rejects() {
+        let cat = puzzled_cat(&["catalogInf".to_string()], true);
+        assert_eq!(
+            cat.as_deref(),
+            Some(
+                "   /\\_/\\  ?\n  ( O_o )   sanshain.yaml: unknown field 'catalogInf' - rejected (strict)\n ---U-U---"
+            )
+        );
+    }
+
+    #[test]
+    fn fields_another_client_knows_get_no_cat() {
+        let fields = unknown(
+            r#"
+sanshainUrl: http://x
+serviceName: s
+clientName: c
+compression: true
+bestEffort: false
+strict: false
+force: true
+insecure: true
+combine: true
+catalogInfo: catalog-info.yaml
+provide:
+  file: a.yaml
+  apiType: openapi
+  retired: false
+  openApiFile: a.yaml
+  asyncApiFile: b.yaml
+  protoFile: c.proto
+  combine: true
+requires:
+  - serviceName: u
+    apiType: openapi
+    version: 1.0.0
+    outputDirectory: out
+    endpoints:
+      - method: GET
+        path: /a
+"#,
+        );
+        assert!(fields.is_empty(), "got: {fields:?}");
+        assert_eq!(puzzled_cat(&fields, true), None);
+    }
+
+    #[test]
+    fn a_legacy_field_still_errors_before_any_cat() {
+        let err = Config::from_yaml_str(
+            "serviceName: s\ncatalogInf: x\nrequires:\n  - serviceName: u\n    branch: main\n    outputDirectory: out\n    endpoints:\n      - method: GET\n        path: /a\n",
+        );
+        match err {
+            Err(Error::Config(message)) => {
+                assert!(
+                    message.contains("'branch' is no longer supported"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected the legacy error, got {other:?}"),
+        }
     }
 
     #[test]

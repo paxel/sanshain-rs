@@ -1,8 +1,8 @@
 use anyhow::bail;
 use clap::{Parser, Subcommand};
 use sanshain::{
-    BEST_EFFORT_ENV_VAR, CONFIG_FILE, Client, Config, STRICT_ENV_VAR, Stream, resolve_stability,
-    resolve_switch_with,
+    BEST_EFFORT_ENV_VAR, CONFIG_FILE, Client, Config, STRICT_ENV_VAR, Stream, puzzled_cat,
+    resolve_stability, resolve_switch_with,
 };
 
 #[derive(Parser)]
@@ -109,6 +109,15 @@ fn main() -> anyhow::Result<()> {
             config.best_effort,
         ),
     };
+
+    // Once per run, before anything else. Under strict an unknown field is a
+    // configuration error, which best effort does not soften.
+    if let Some(cat) = puzzled_cat(&config.unknown_fields, mode.strict) {
+        eprintln!("{cat}");
+        if mode.strict {
+            bail!("strict: {CONFIG_FILE} has unknown fields");
+        }
+    }
 
     match args.command {
         Commands::Provide { ga, stream } => provide(&config, &mode, ga, &stream),
