@@ -29,6 +29,9 @@ requires:
         path: /api/v1/users/{id}
 ```
 
+Relative paths in it (`file`, `outputDirectory`) resolve against the directory containing
+`sanshain.yaml`, not the working directory.
+
 ## Commands
 
 ```console

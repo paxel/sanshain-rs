@@ -2,7 +2,7 @@
 //! actually sends (stability, version, no branch-era fields) and how failures
 //! (409, 404, 410, pre-2.0 server) are surfaced.
 
-use sanshain::{ApiType, Client, Endpoint, Error, ProvideEntry, RequireEntry, Stability};
+use sanshain::{ApiType, Client, Config, Endpoint, Error, ProvideEntry, RequireEntry, Stability};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -409,4 +409,66 @@ fn require_absent_endpoint_fails_with_deliberate_absence_message() {
     assert!(message.contains("410, absent"), "unexpected: {message}");
     assert!(message.contains("deliberately"), "unexpected: {message}");
     drop(joined_requests(handle));
+}
+
+/// A config in another folder than the working directory: its relative paths
+/// resolve next to it, absolute ones stay absolute.
+#[test]
+fn relative_paths_resolve_against_the_config_directory() {
+    let dir = test_dir("config_elsewhere/project");
+    let absolute_out = test_dir("config_elsewhere/absolute-out");
+    if let Err(err) = std::fs::create_dir_all(dir.join("specs")) {
+        panic!("failed to create spec dir: {err}");
+    }
+    let spec = "openapi: 3.0.3\ninfo:\n  title: Elsewhere\n  version: 1.4.0\npaths: {}\n";
+    if let Err(err) = std::fs::write(dir.join("specs/openapi.yaml"), spec) {
+        panic!("failed to write spec file: {err}");
+    }
+    let yaml = format!(
+        "serviceName: demo-service\nprovides:\n  - file: specs/openapi.yaml\nrequires:\n  - serviceName: user-service\n    version: 1.2.0\n    outputDirectory: generated/user-service\n    endpoints:\n      - method: GET\n        path: /x\n  - serviceName: order-service\n    version: 1.0.0\n    outputDirectory: {}\n    endpoints:\n      - method: GET\n        path: /y\n",
+        absolute_out.display()
+    );
+    let config_path = dir.join("sanshain.yaml");
+    if let Err(err) = std::fs::write(&config_path, yaml) {
+        panic!("failed to write config: {err}");
+    }
+    let config = match Config::from_yaml_file(&config_path) {
+        Ok(config) => config,
+        Err(err) => panic!("config should load: {err}"),
+    };
+    assert_eq!(config.provides[0].file, dir.join("specs/openapi.yaml"));
+    assert_eq!(
+        config.requires[0].output_directory,
+        dir.join("generated/user-service")
+    );
+    assert_eq!(config.requires[1].output_directory, absolute_out);
+
+    // The provide reads the spec next to the config, and the require writes
+    // next to it — neither depends on where the test runs.
+    let (url, handle) = mock_server(vec![
+        accepted_response(),
+        http_response("200 OK", "application/yaml", "openapi: 3.0.3\n"),
+    ]);
+    let client = Client::new(url.as_str(), None);
+    if let Err(err) = client.provide("demo-service", &config.provides[0], Stability::Snapshot) {
+        panic!("provide failed: {err}");
+    }
+    let written = match client.require("demo-service", &config.requires[0]) {
+        Ok(written) => written,
+        Err(err) => panic!("require failed: {err}"),
+    };
+    assert_eq!(
+        written,
+        dir.join("generated/user-service").join("user-service.yaml")
+    );
+    let requests = joined_requests(handle);
+    let payload: serde_json::Value = match serde_json::from_str(body_of(&requests[0])) {
+        Ok(payload) => payload,
+        Err(err) => panic!("provide body is not JSON: {err}"),
+    };
+    assert!(
+        payload["openapi_yaml"]
+            .as_str()
+            .is_some_and(|yaml| yaml.contains("title: Elsewhere"))
+    );
 }

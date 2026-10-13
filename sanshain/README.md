@@ -53,6 +53,9 @@ requires:
 - **Every requires entry pins an exact version.** What your build downloads changes only
   when someone edits `version`. A pin that does not exist fails immediately with `404`.
 - A single `provide` mapping is accepted in place of the `provides` list.
+- Relative paths (`file`, `outputDirectory`) resolve against the directory containing
+  `sanshain.yaml` when it is loaded with [`Config::from_yaml_file`], never against the working
+  directory. Absolute paths stay absolute.
 - Configuration is validated before any network call; removed 1.x-era fields (`branch`,
   `timeout`, `baseVersion`, `releaseBranches`, `stability`, `spec_id`, `api_key`,
   `service_url`) are rejected by name with a migration hint.

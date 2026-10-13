@@ -406,6 +406,11 @@ fn is_pinnable_version(version: &str) -> bool {
 
 impl Config {
     /// Loads configuration from a `sanshain.yaml` file.
+    ///
+    /// Every relative path in it (`file`, `outputDirectory`) is resolved
+    /// against the directory containing the file, never the working directory,
+    /// so a build pointed at a config elsewhere finds the same files as one
+    /// started next to it. Absolute paths stay as they are.
     pub fn from_yaml_file(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let text = fs::read_to_string(path).map_err(|e| {
@@ -414,7 +419,22 @@ impl Config {
                 path.display()
             ))
         })?;
-        Self::from_yaml_str(&text)
+        let mut config = Self::from_yaml_str(&text)?;
+        if let Some(dir) = path.parent() {
+            config.resolve_paths_against(dir);
+        }
+        Ok(config)
+    }
+
+    /// Rebases every relative path on `dir`; `Path::join` keeps an absolute
+    /// path absolute.
+    fn resolve_paths_against(&mut self, dir: &Path) {
+        for entry in &mut self.provides {
+            entry.file = dir.join(&entry.file);
+        }
+        for entry in &mut self.requires {
+            entry.output_directory = dir.join(&entry.output_directory);
+        }
     }
 
     /// Parses and validates a `sanshain.yaml` document.
