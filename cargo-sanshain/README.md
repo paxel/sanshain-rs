@@ -32,8 +32,8 @@ requires:
 Relative paths in it (`file`, `outputDirectory`) resolve against the directory containing
 `sanshain.yaml`, not the working directory.
 
-A field no Sanshain client knows is reported once per run on stderr, and the command
-carries on:
+A field no Sanshain client knows is reported once per run on stderr — before any other
+validation error it may cause — and the command carries on:
 
 ```text
    /\_/\  ?

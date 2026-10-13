@@ -91,40 +91,51 @@ fn main() -> anyhow::Result<()> {
     // Clap's `bin_name = "cargo"` and the `CargoCli` enum handle this correctly.
     let CargoCli::Sanshain(args) = CargoCli::parse();
 
-    let config = match Config::from_yaml_file(CONFIG_FILE) {
+    // A configuration that cannot be loaded cannot say `bestEffort`, so only
+    // the flag and the environment soften it — as in sanshain-js.
+    let fallback =
+        || resolve_switch_with(args.best_effort, env(BEST_EFFORT_ENV_VAR).as_deref(), false);
+    let warn_and_continue = |err: sanshain::Error| {
+        eprintln!("Warning loading config: {err}");
+        eprintln!("Continuing (best effort)");
+    };
+    // Unreadable file, invalid YAML or a legacy field: nothing else is known.
+    let loaded = match Config::load_yaml_file(CONFIG_FILE) {
+        Ok(loaded) => loaded,
+        Err(err) if fallback() => {
+            warn_and_continue(err);
+            return Ok(());
+        }
+        Err(err) => return Err(err.into()),
+    };
+
+    // Once per run, right after the legacy rejections and before any other
+    // validation, so a typo shows even when it causes the next error. Under
+    // strict an unknown field fails here, and best effort does not soften it.
+    let strict = resolve_switch_with(false, env(STRICT_ENV_VAR).as_deref(), loaded.strict);
+    if let Some(cat) = puzzled_cat(&loaded.unknown_fields, strict) {
+        eprintln!("{cat}");
+        if strict {
+            bail!("strict: {CONFIG_FILE} has unknown fields");
+        }
+    }
+
+    let config = match loaded.config {
         Ok(config) => config,
-        // A configuration that cannot be loaded cannot say `bestEffort`, so
-        // only the flag and the environment soften it — as in sanshain-js.
-        Err(err)
-            if resolve_switch_with(
-                args.best_effort,
-                env(BEST_EFFORT_ENV_VAR).as_deref(),
-                false,
-            ) =>
-        {
-            eprintln!("Warning loading config: {err}");
-            eprintln!("Continuing (best effort)");
+        Err(err) if fallback() => {
+            warn_and_continue(err);
             return Ok(());
         }
         Err(err) => return Err(err.into()),
     };
     let mode = Mode {
-        strict: resolve_switch_with(false, env(STRICT_ENV_VAR).as_deref(), config.strict),
+        strict,
         best_effort: resolve_switch_with(
             args.best_effort,
             env(BEST_EFFORT_ENV_VAR).as_deref(),
             config.best_effort,
         ),
     };
-
-    // Once per run, before anything else. Under strict an unknown field is a
-    // configuration error, which best effort does not soften.
-    if let Some(cat) = puzzled_cat(&config.unknown_fields, mode.strict) {
-        eprintln!("{cat}");
-        if mode.strict {
-            bail!("strict: {CONFIG_FILE} has unknown fields");
-        }
-    }
 
     match args.command {
         Commands::Provide { ga, stream } => provide(&config, &mode, ga, &stream),

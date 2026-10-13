@@ -14,8 +14,7 @@ repository.workspace = true
 [dependencies]
 ureq = { version = "2.9", features = ["json"] }
 serde = { version = "1.0", features = ["derive"] }
-# preserve_order: unknown sanshain.yaml fields are reported in file order.
-serde_json = { version = "1.0", features = ["preserve_order"] }
+serde_json = "1.0"
 # The same YAML reader the Sanshain service uses, so client and server agree on
 # what a document means rather than agreeing by coincidence.
 serde_yaml_ng = "0.10"

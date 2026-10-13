@@ -15,6 +15,7 @@
 
 use serde::Deserialize;
 use serde_json::{Value, json};
+use serde_yaml_ng::Value as YamlValue;
 use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -458,37 +459,45 @@ const KNOWN_REQUIRE_FIELDS: &[&str] = &[
 const KNOWN_ENDPOINT_FIELDS: &[&str] = &["method", "path"];
 
 /// Appends `prefix` + each key of `value` not in `known` to `out`, in order.
-fn collect_unknown(value: &Value, known: &[&str], prefix: &str, out: &mut Vec<String>) {
-    if let Some(obj) = value.as_object() {
-        for key in obj.keys() {
-            if !known.contains(&key.as_str()) {
-                out.push(format!("{prefix}{key}"));
-            }
+fn collect_unknown(value: &YamlValue, known: &[&str], prefix: &str, out: &mut Vec<String>) {
+    for key in value.as_mapping().into_iter().flat_map(|m| m.keys()) {
+        let key = yaml_key(key);
+        if !known.contains(&key.as_str()) {
+            out.push(format!("{prefix}{key}"));
         }
     }
 }
 
-/// Every unknown field of a configuration, as a path, in file order.
-fn unknown_fields(obj: &serde_json::Map<String, Value>) -> Vec<String> {
+fn yaml_key(key: &YamlValue) -> String {
+    match key.as_str() {
+        Some(key) => key.to_string(),
+        None => serde_yaml_ng::to_string(key)
+            .map(|k| k.trim_end().to_string())
+            .unwrap_or_default(),
+    }
+}
+
+/// Every unknown field of a configuration, as a path, in document order —
+/// read from the YAML value, whose mappings keep the order of the file.
+fn unknown_fields(value: &YamlValue) -> Vec<String> {
     let mut out = Vec::new();
-    for (key, value) in obj {
+    for (key, value) in value.as_mapping().into_iter().flatten() {
+        let key = yaml_key(key);
         match key.as_str() {
             "provide" => collect_unknown(value, KNOWN_PROVIDE_FIELDS, "provide.", &mut out),
             "provides" => {
-                for (i, entry) in value.as_array().into_iter().flatten().enumerate() {
+                for (i, entry) in value.as_sequence().into_iter().flatten().enumerate() {
                     let prefix = format!("provides[{i}].");
                     collect_unknown(entry, KNOWN_PROVIDE_FIELDS, &prefix, &mut out);
                 }
             }
             "requires" => {
-                for (i, entry) in value.as_array().into_iter().flatten().enumerate() {
-                    let Some(entry_obj) = entry.as_object() else {
-                        continue;
-                    };
-                    for (field, field_value) in entry_obj {
+                for (i, entry) in value.as_sequence().into_iter().flatten().enumerate() {
+                    for (field, field_value) in entry.as_mapping().into_iter().flatten() {
+                        let field = yaml_key(field);
                         if field == "endpoints" {
                             for (j, endpoint) in
-                                field_value.as_array().into_iter().flatten().enumerate()
+                                field_value.as_sequence().into_iter().flatten().enumerate()
                             {
                                 let prefix = format!("requires[{i}].endpoints[{j}].");
                                 collect_unknown(endpoint, KNOWN_ENDPOINT_FIELDS, &prefix, &mut out);
@@ -561,14 +570,135 @@ fn is_pinnable_version(version: &str) -> bool {
             .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
 }
 
+/// A `sanshain.yaml` that parsed as YAML and passed the legacy-field
+/// rejections. Its unknown fields are known at this point, whether or not the
+/// remaining validation succeeds — so a command can show them either way.
+#[derive(Debug)]
+pub struct LoadedConfig {
+    /// Fields no Sanshain client knows, as paths in file order.
+    pub unknown_fields: Vec<String>,
+    /// `strict: true` as written in the file, readable even when the rest of
+    /// the validation fails.
+    pub strict: bool,
+    /// The validated configuration, or the first validation error.
+    pub config: Result<Config>,
+}
+
+fn invalid(e: impl std::fmt::Display) -> Error {
+    Error::Config(format!("invalid {CONFIG_FILE}: {e}"))
+}
+
+fn as_mapping(value: &Value) -> Result<&serde_json::Map<String, Value>> {
+    value
+        .as_object()
+        .ok_or_else(|| Error::Config("sanshain.yaml must be a mapping".to_string()))
+}
+
+/// Rejects every leftover pre-2.0 field, at every level, by name with a
+/// migration hint. Runs before anything else looks at the document.
+fn check_legacy_fields(obj: &serde_json::Map<String, Value>) -> Result<()> {
+    check_removed_fields(obj, "")?;
+    if let Some(single) = obj.get("provide").and_then(Value::as_object) {
+        check_removed_fields(single, "provide")?;
+    }
+    if let Some(Value::Array(list)) = obj.get("provides") {
+        for (i, entry) in list.iter().enumerate() {
+            if let Some(entry_obj) = entry.as_object() {
+                check_removed_fields(entry_obj, &format!("provides[{i}]"))?;
+            }
+        }
+    }
+    if let Some(Value::Array(list)) = obj.get("requires") {
+        for (i, entry) in list.iter().enumerate() {
+            if let Some(entry_obj) = entry.as_object() {
+                check_removed_fields(entry_obj, &require_context(i, entry_obj))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn require_context(i: usize, entry_obj: &serde_json::Map<String, Value>) -> String {
+    let name = entry_obj
+        .get("serviceName")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    format!("requires[{i}] ({name})")
+}
+
+/// Everything after the legacy rejections and the unknown-field detection:
+/// pins, endpoints, and the shape of each field.
+fn validate(value: &Value, unknown_fields: Vec<String>) -> Result<Config> {
+    let obj = as_mapping(value)?;
+    if let Some(Value::Array(list)) = obj.get("requires") {
+        for (i, entry) in list.iter().enumerate() {
+            let Some(entry_obj) = entry.as_object() else {
+                continue;
+            };
+            let name = entry_obj
+                .get("serviceName")
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            let context = require_context(i, entry_obj);
+            match entry_obj.get("version") {
+                None => {
+                    return Err(Error::Config(format!(
+                        "{context}: missing 'version' — Sanshain 2.0 pins exact versions; add version = \"1.2.0\" (list available: GET /producers/{name}/versions)"
+                    )));
+                }
+                Some(version) => {
+                    let version = version.as_str().unwrap_or("");
+                    if !is_pinnable_version(version) {
+                        return Err(Error::Config(format!(
+                            "{context}: version '{version}' is not a version — pin MAJOR[.MINOR[.PATCH]], optionally v-prefixed (no ranges, no 'latest')"
+                        )));
+                    }
+                }
+            }
+            match entry_obj.get("endpoints") {
+                Some(Value::Array(endpoints)) if !endpoints.is_empty() => {}
+                _ => {
+                    return Err(Error::Config(format!(
+                        "{context}: 'endpoints' must list at least one endpoint (method + path)"
+                    )));
+                }
+            }
+        }
+    }
+
+    let raw: RawConfig = serde_json::from_value(value.clone()).map_err(invalid)?;
+    let mut provides = Vec::new();
+    if let Some(single) = raw.provide {
+        provides.push(single);
+    }
+    provides.extend(raw.provides);
+    Ok(Config {
+        sanshain_url: raw.sanshain_url,
+        service_name: raw.service_name,
+        provides,
+        requires: raw.requires,
+        strict: raw.strict,
+        best_effort: raw.best_effort,
+        catalog_info: raw.catalog_info,
+        unknown_fields,
+    })
+}
+
 impl Config {
     /// Loads configuration from a `sanshain.yaml` file.
     ///
-    /// Every relative path in it (`file`, `outputDirectory`, `catalogInfo`) is resolved
-    /// against the directory containing the file, never the working directory,
-    /// so a build pointed at a config elsewhere finds the same files as one
-    /// started next to it. Absolute paths stay as they are.
+    /// Every relative path in it (`file`, `outputDirectory`, `catalogInfo`) is
+    /// resolved against the (absolute) directory containing the file, never the
+    /// working directory, so a build pointed at a config elsewhere finds the
+    /// same files as one started next to it. Absolute paths stay as they are.
     pub fn from_yaml_file(path: impl AsRef<Path>) -> Result<Self> {
+        Self::load_yaml_file(path)?.config
+    }
+
+    /// [`Config::from_yaml_file`] in two phases: the error is an unreadable
+    /// file, invalid YAML or a legacy field; anything validated later is
+    /// in [`LoadedConfig::config`], next to the already known unknown fields.
+    pub fn load_yaml_file(path: impl AsRef<Path>) -> Result<LoadedConfig> {
         let path = path.as_ref();
         let text = fs::read_to_string(path).map_err(|e| {
             Error::Config(format!(
@@ -576,11 +706,12 @@ impl Config {
                 path.display()
             ))
         })?;
-        let mut config = Self::from_yaml_str(&text)?;
-        if let Some(dir) = path.parent() {
+        let mut loaded = Self::load_yaml_str(&text)?;
+        let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+        if let (Ok(config), Some(dir)) = (&mut loaded.config, absolute.parent()) {
             config.resolve_paths_against(dir);
         }
-        Ok(config)
+        Ok(loaded)
     }
 
     /// Rebases every relative path on `dir`; `Path::join` keeps an absolute
@@ -599,90 +730,36 @@ impl Config {
 
     /// Parses and validates a `sanshain.yaml` document.
     pub fn from_yaml_str(yaml: &str) -> Result<Self> {
-        let value: Value = serde_yaml_ng::from_str(yaml)
-            .map_err(|e| Error::Config(format!("invalid {CONFIG_FILE}: {e}")))?;
-        Self::from_value(&value)
+        Self::load_yaml_str(yaml)?.config
+    }
+
+    /// [`Config::from_yaml_str`] in two phases, see [`Config::load_yaml_file`].
+    /// Order: YAML parse, legacy-field rejections, unknown-field detection,
+    /// then every other validation.
+    pub fn load_yaml_str(yaml: &str) -> Result<LoadedConfig> {
+        let yaml_value: YamlValue = serde_yaml_ng::from_str(yaml).map_err(invalid)?;
+        let value = serde_json::to_value(&yaml_value).map_err(invalid)?;
+        let obj = as_mapping(&value)?;
+        check_legacy_fields(obj)?;
+        let unknown_fields = unknown_fields(&yaml_value);
+        Ok(LoadedConfig {
+            strict: obj.get("strict").and_then(Value::as_bool).unwrap_or(false),
+            config: validate(&value, unknown_fields.clone()),
+            unknown_fields,
+        })
     }
 
     /// Parses and validates a configuration value. All validation happens here,
     /// before any network call: a requires entry without `version` and every
     /// leftover pre-2.0 field are hard errors carrying a migration hint. Any
-    /// other field no client knows is collected in [`Config::unknown_fields`].
+    /// other field no client knows is collected in [`Config::unknown_fields`]
+    /// (in the map's order — file order only when loaded from YAML).
     pub fn from_value(value: &Value) -> Result<Self> {
-        let obj = value
-            .as_object()
-            .ok_or_else(|| Error::Config("sanshain.yaml must be a mapping".to_string()))?;
-        check_removed_fields(obj, "")?;
-
-        let mut provide_scopes: Vec<(String, &Value)> = Vec::new();
-        if let Some(single) = obj.get("provide") {
-            provide_scopes.push(("provide".to_string(), single));
-        }
-        if let Some(Value::Array(list)) = obj.get("provides") {
-            for (i, entry) in list.iter().enumerate() {
-                provide_scopes.push((format!("provides[{i}]"), entry));
-            }
-        }
-        for (context, entry) in &provide_scopes {
-            if let Some(entry_obj) = entry.as_object() {
-                check_removed_fields(entry_obj, context)?;
-            }
-        }
-
-        if let Some(Value::Array(list)) = obj.get("requires") {
-            for (i, entry) in list.iter().enumerate() {
-                let Some(entry_obj) = entry.as_object() else {
-                    continue;
-                };
-                let name = entry_obj
-                    .get("serviceName")
-                    .and_then(Value::as_str)
-                    .unwrap_or("?");
-                let context = format!("requires[{i}] ({name})");
-                check_removed_fields(entry_obj, &context)?;
-                match entry_obj.get("version") {
-                    None => {
-                        return Err(Error::Config(format!(
-                            "{context}: missing 'version' — Sanshain 2.0 pins exact versions; add version = \"1.2.0\" (list available: GET /producers/{name}/versions)"
-                        )));
-                    }
-                    Some(version) => {
-                        let version = version.as_str().unwrap_or("");
-                        if !is_pinnable_version(version) {
-                            return Err(Error::Config(format!(
-                                "{context}: version '{version}' is not a version — pin MAJOR[.MINOR[.PATCH]], optionally v-prefixed (no ranges, no 'latest')"
-                            )));
-                        }
-                    }
-                }
-                match entry_obj.get("endpoints") {
-                    Some(Value::Array(endpoints)) if !endpoints.is_empty() => {}
-                    _ => {
-                        return Err(Error::Config(format!(
-                            "{context}: 'endpoints' must list at least one endpoint (method + path)"
-                        )));
-                    }
-                }
-            }
-        }
-
-        let raw: RawConfig = serde_json::from_value(value.clone())
-            .map_err(|e| Error::Config(format!("invalid {CONFIG_FILE}: {e}")))?;
-        let mut provides = Vec::new();
-        if let Some(single) = raw.provide {
-            provides.push(single);
-        }
-        provides.extend(raw.provides);
-        Ok(Config {
-            sanshain_url: raw.sanshain_url,
-            service_name: raw.service_name,
-            provides,
-            requires: raw.requires,
-            strict: raw.strict,
-            best_effort: raw.best_effort,
-            catalog_info: raw.catalog_info,
-            unknown_fields: unknown_fields(obj),
-        })
+        check_legacy_fields(as_mapping(value)?)?;
+        let unknown_fields = serde_yaml_ng::to_value(value)
+            .map(|yaml| unknown_fields(&yaml))
+            .unwrap_or_default();
+        validate(value, unknown_fields)
     }
 }
 
@@ -1676,6 +1753,29 @@ requires:
             config.and_then(|c| c.catalog_info),
             Some(PathBuf::from("catalog-info.yaml"))
         );
+    }
+
+    #[test]
+    fn unknown_fields_are_known_even_when_a_later_validation_fails() {
+        let loaded = match Config::load_yaml_str(
+            "serviceName: s\nrequires:\n  - serviceName: u\n    verison: 1.2.0\n    outputDirectory: out\n    endpoints:\n      - method: GET\n        path: /a\n",
+        ) {
+            Ok(loaded) => loaded,
+            Err(err) => panic!("only the later validation should fail, got {err}"),
+        };
+        assert_eq!(loaded.unknown_fields, vec!["requires[0].verison"]);
+        match loaded.config {
+            Err(Error::Config(message)) => {
+                assert!(message.contains("missing 'version'"), "{message}");
+            }
+            other => panic!("expected the missing-version error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strict_in_the_file_is_readable_when_validation_fails() {
+        let loaded = Config::load_yaml_str("strict: true\nrequires:\n  - serviceName: u\n");
+        assert!(loaded.as_ref().is_ok_and(|l| l.strict && l.config.is_err()));
     }
 
     #[test]

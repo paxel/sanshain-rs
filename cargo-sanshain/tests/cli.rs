@@ -525,8 +525,10 @@ fn catalog_400_fails_and_best_effort_turns_it_into_a_warning() {
     let output = run(&dir, &["catalog"], &[]);
     assert_failure(&output);
     assert!(
-        stderr(&output)
-            .contains("The Component's metadata.name must equal serviceName 'orders-service'."),
+        stderr(&output).contains(&format!(
+            "Sanshain rejected {}: no Component named 'orders-service'. The Component's metadata.name must equal serviceName 'orders-service'.",
+            dir.join("catalog-info.yaml").display()
+        )),
         "unexpected stderr: {}",
         stderr(&output)
     );
@@ -579,14 +581,86 @@ fn catalog_with_a_missing_file_names_the_resolved_path() {
     );
     let output = run(&dir, &["catalog"], &[]);
     assert_failure(&output);
-    // The config is the working directory's own, so the resolved path is the
-    // configured one; wire.rs covers a config in another folder.
+    let resolved = dir.join("docs/catalog.yaml");
     assert!(
-        stderr(&output).contains("cannot read catalogInfo docs/catalog.yaml"),
+        stderr(&output).contains(&format!("cannot read catalogInfo {}", resolved.display())),
         "unexpected stderr: {}",
         stderr(&output)
     );
     let output = run(&dir, &["catalog"], &[("SANSHAIN_BEST_EFFORT", "true")]);
     assert_success(&output);
     assert!(stderr(&output).contains("docs/catalog.yaml"));
+}
+
+// --- the cat comes before every other validation ---
+
+/// `verison` instead of `version`: the typo is the cause of the next error, so
+/// the cat must show before it.
+const TYPO_THEN_MISSING_VERSION: &str = "serviceName: demo-service\nrequires:\n  - serviceName: user-service\n    verison: 1.2.0\n    outputDirectory: out\n    endpoints:\n      - method: GET\n        path: /x\n";
+
+const CAT_VERISON: &str = "   /\\_/\\  ?\n  ( O_o )   sanshain.yaml: unknown field 'requires[0].verison' - ignored\n ---U-U---\n";
+
+#[test]
+fn the_cat_shows_before_a_later_validation_error() {
+    let dir = project("cat_then_missing_version");
+    write(&dir.join("sanshain.yaml"), TYPO_THEN_MISSING_VERSION);
+    let output = run(&dir, &["require"], &[]);
+    assert_failure(&output);
+    let err = stderr(&output);
+    assert!(err.starts_with(CAT_VERISON), "unexpected stderr: {err}");
+    assert!(
+        err.contains("missing 'version'"),
+        "unexpected stderr: {err}"
+    );
+}
+
+#[test]
+fn the_cat_shows_on_the_best_effort_fallback() {
+    let dir = project("cat_then_fallback");
+    write(&dir.join("sanshain.yaml"), TYPO_THEN_MISSING_VERSION);
+    let output = run(&dir, &["require", "--best-effort"], &[]);
+    assert_success(&output);
+    let err = stderr(&output);
+    assert!(err.starts_with(CAT_VERISON), "unexpected stderr: {err}");
+    assert!(
+        err.contains("Warning loading config") && err.contains("missing 'version'"),
+        "unexpected stderr: {err}"
+    );
+}
+
+#[test]
+fn under_strict_unknown_fields_fail_before_other_validation() {
+    let dir = project("cat_strict_first");
+    write(
+        &dir.join("sanshain.yaml"),
+        &format!("strict: true\n{TYPO_THEN_MISSING_VERSION}"),
+    );
+    let output = run(&dir, &["require", "--best-effort"], &[]);
+    assert_failure(&output);
+    let err = stderr(&output);
+    assert!(
+        err.contains("'requires[0].verison' - rejected (strict)"),
+        "unexpected stderr: {err}"
+    );
+    assert!(
+        !err.contains("missing 'version'"),
+        "unexpected stderr: {err}"
+    );
+}
+
+#[test]
+fn a_legacy_field_errors_before_any_cat() {
+    let dir = project("legacy_before_cat");
+    write(
+        &dir.join("sanshain.yaml"),
+        "serviceName: demo-service\ncatalogInf: x\nrequires:\n  - serviceName: user-service\n    branch: main\n    outputDirectory: out\n    endpoints:\n      - method: GET\n        path: /x\n",
+    );
+    let output = run(&dir, &["require"], &[]);
+    assert_failure(&output);
+    let err = stderr(&output);
+    assert!(
+        err.contains("'branch' is no longer supported"),
+        "unexpected stderr: {err}"
+    );
+    assert!(!err.contains("O_o"), "unexpected stderr: {err}");
 }
