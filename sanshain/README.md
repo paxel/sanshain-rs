@@ -31,6 +31,7 @@ for entry in &config.provides {
 ```yaml
 serviceName: gateway-service
 sanshainUrl: http://localhost:3000
+catalogInfo: catalog-info.yaml   # optional — see "Catalog" below
 
 provides:
   - file: specs/openapi.yaml
@@ -56,7 +57,7 @@ requires:
 - **Every requires entry pins an exact version.** What your build downloads changes only
   when someone edits `version`. A pin that does not exist fails immediately with `404`.
 - A single `provide` mapping is accepted in place of the `provides` list.
-- Relative paths (`file`, `outputDirectory`) resolve against the directory containing
+- Relative paths (`file`, `outputDirectory`, `catalogInfo`) resolve against the directory containing
   `sanshain.yaml` when it is loaded with [`Config::from_yaml_file`], never against the working
   directory. Absolute paths stay absolute.
 - `strict: true` and `bestEffort: true` are read into [`Config::strict`] and
@@ -112,6 +113,18 @@ untouched.
 Retiring needs the `releaser` role — which a release pipeline already holds — or a
 maintainer grant on that Producer.
 
+## Catalog
+
+`catalogInfo` names the project's Backstage `catalog-info.yaml`. [`Client::catalog`] pushes it
+with `PUT /catalog/<serviceName>`, so the network graph shows the peripheral resources
+(databases, buckets, queues) the system depends on. Sanshain reads only the `Component` whose
+`metadata.name` equals `serviceName`, and of it only `spec.dependsOn`; each push replaces the
+previous set. A trunk stream sends `trunk: true` and updates the main graph as well as the
+dev graph; any other stream updates only the dev graph. The returned [`CatalogResponse`]
+lists the recorded resources.
+
+This needs **Sanshain Service 2.4.0 or later**; every other call works with any 2.x service.
+
 ## AsyncAPI 2.x perspective
 
 Sanshain reads 2.x `publish`/`subscribe` from the **application's** perspective: `publish`
@@ -132,6 +145,9 @@ Harvested subscriptions come back on the provide response as
 - **409** — the version rules refused the provide; the message carries `proposed_version`.
   The fix is always a version bump in your own spec file; the client never edits it.
 - **410** — the pinned version exists but deliberately lacks the requested endpoints.
+- **400 on a catalog push** — Sanshain could not read the file as this project's Component;
+  usually its `metadata.name` is not the `serviceName`.
+- **404 on a catalog push** — the service is older than 2.4.0; the message names its version.
 - **Pre-2.0 server** — after a failure the client makes one lazy `GET /version` and reports
   an old instance as such.
 

@@ -2,7 +2,9 @@
 //! actually sends (stability, version, no branch-era fields) and how failures
 //! (409, 404, 410, pre-2.0 server) are surfaced.
 
-use sanshain::{ApiType, Client, Config, Endpoint, Error, ProvideEntry, RequireEntry, Stability};
+use sanshain::{
+    ApiType, Client, Config, Endpoint, Error, ProvideEntry, RequireEntry, Stability, Stream,
+};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -470,5 +472,216 @@ fn relative_paths_resolve_against_the_config_directory() {
         payload["openapi_yaml"]
             .as_str()
             .is_some_and(|yaml| yaml.contains("title: Elsewhere"))
+    );
+}
+
+// --- catalog ---
+
+fn catalog_ok_response(trunk: bool) -> String {
+    http_response(
+        "200 OK",
+        "application/json",
+        &format!(
+            r#"{{"system":"orders-service","trunk":{trunk},"resources":["resource:default/orders-db","resource:default/orders-bucket"]}}"#
+        ),
+    )
+}
+
+fn catalog_file(name: &str) -> PathBuf {
+    let file = test_dir(name).join("catalog-info.yaml");
+    let content =
+        "apiVersion: backstage.io/v1alpha1\nkind: Component\nmetadata:\n  name: orders-service\n";
+    if let Err(err) = std::fs::write(&file, content) {
+        panic!("failed to write catalog file: {err}");
+    }
+    file
+}
+
+fn json_body(request: &str) -> serde_json::Value {
+    match serde_json::from_str(body_of(request)) {
+        Ok(payload) => payload,
+        Err(err) => panic!("body is not JSON: {err}"),
+    }
+}
+
+#[test]
+fn catalog_sends_trunk_only_on_a_trunk_build_and_never_a_tag() {
+    let file = catalog_file("catalog_streams");
+    let cases = [
+        (Stream::Trunk, true),
+        (Stream::None, false),
+        (Stream::Tag("Release-Maribou".to_string()), false),
+    ];
+    for (stream, trunk) in cases {
+        let (url, handle) = mock_server(vec![catalog_ok_response(trunk)]);
+        let client = Client::new(url.as_str(), None).with_stream(stream.clone());
+        let recorded = match client.catalog("orders-service", &file) {
+            Ok(recorded) => recorded,
+            Err(err) => panic!("catalog failed for {stream}: {err}"),
+        };
+        assert_eq!(recorded.trunk, trunk);
+        let requests = joined_requests(handle);
+        assert_eq!(requests.len(), 1, "no preflight requests expected");
+        assert!(
+            request_line(&requests[0]).starts_with("PUT /catalog/orders-service "),
+            "unexpected: {}",
+            request_line(&requests[0])
+        );
+        let payload = json_body(&requests[0]);
+        assert!(
+            payload["catalog_info_yaml"]
+                .as_str()
+                .is_some_and(|yaml| yaml.contains("name: orders-service"))
+        );
+        assert_eq!(payload.get("trunk").is_some(), trunk, "{stream}: {payload}");
+        if trunk {
+            assert_eq!(payload["trunk"], true);
+        }
+        assert!(payload.get("tag").is_none(), "{stream}: {payload}");
+    }
+}
+
+#[test]
+fn catalog_returns_the_recorded_resources() {
+    let file = catalog_file("catalog_ok");
+    let (url, handle) = mock_server(vec![catalog_ok_response(true)]);
+    let client = Client::new(url.as_str(), Some("tok".to_string())).with_stream(Stream::Trunk);
+    let recorded = match client.catalog("orders-service", &file) {
+        Ok(recorded) => recorded,
+        Err(err) => panic!("catalog failed: {err}"),
+    };
+    assert_eq!(recorded.system, "orders-service");
+    assert_eq!(
+        recorded.resources,
+        vec![
+            "resource:default/orders-db",
+            "resource:default/orders-bucket"
+        ]
+    );
+    let requests = joined_requests(handle);
+    assert!(requests[0].contains("Authorization: Bearer tok"));
+}
+
+#[test]
+fn catalog_url_encodes_the_service_name() {
+    let file = catalog_file("catalog_encoded");
+    let (url, handle) = mock_server(vec![catalog_ok_response(false)]);
+    let client = Client::new(url.as_str(), None);
+    if let Err(err) = client.catalog("my service/x", &file) {
+        panic!("catalog failed: {err}");
+    }
+    let requests = joined_requests(handle);
+    assert!(
+        request_line(&requests[0]).starts_with("PUT /catalog/my%20service%2Fx "),
+        "unexpected: {}",
+        request_line(&requests[0])
+    );
+}
+
+#[test]
+fn catalog_400_names_the_file_and_the_metadata_name_rule() {
+    let file = catalog_file("catalog_400");
+    let (url, handle) = mock_server(vec![
+        http_response(
+            "400 Bad Request",
+            "application/json",
+            r#"{"error":"no Component named 'orders-service'"}"#,
+        ),
+        version_response("2.4.0"),
+    ]);
+    let client = Client::new(url.as_str(), None);
+    let message = match client.catalog("orders-service", &file) {
+        Err(err) => err.to_string(),
+        Ok(_) => panic!("expected the catalog push to be rejected"),
+    };
+    assert_eq!(
+        message,
+        format!(
+            "Sanshain rejected {}: no Component named 'orders-service'. The Component's metadata.name must equal serviceName 'orders-service'.",
+            file.display()
+        )
+    );
+    drop(joined_requests(handle));
+}
+
+#[test]
+fn catalog_404_reports_the_service_is_older_than_2_4() {
+    let file = catalog_file("catalog_404");
+    let (url, handle) = mock_server(vec![
+        http_response("404 Not Found", "text/plain", ""),
+        version_response("2.3.0"),
+    ]);
+    let client = Client::new(url.as_str(), None);
+    let message = match client.catalog("orders-service", &file) {
+        Err(err) => err.to_string(),
+        Ok(_) => panic!("expected the catalog push to fail"),
+    };
+    assert_eq!(
+        message,
+        "sanshain catalog needs Sanshain Service 2.4.0 or later (server is 2.3.0)"
+    );
+    let requests = joined_requests(handle);
+    assert!(request_line(&requests[1]).starts_with("GET /version "));
+
+    let (url, handle) = mock_server(vec![
+        http_response("404 Not Found", "text/plain", ""),
+        http_response("404 Not Found", "text/plain", ""),
+    ]);
+    let client = Client::new(url.as_str(), None);
+    let message = match client.catalog("orders-service", &file) {
+        Err(err) => err.to_string(),
+        Ok(_) => panic!("expected the catalog push to fail"),
+    };
+    assert_eq!(
+        message,
+        "sanshain catalog needs Sanshain Service 2.4.0 or later (server version unknown)"
+    );
+    drop(joined_requests(handle));
+}
+
+#[test]
+fn catalog_without_the_file_names_the_resolved_path() {
+    let missing = test_dir("catalog_missing").join("nope.yaml");
+    let client = Client::new("http://127.0.0.1:9", None);
+    let message = match client.catalog("orders-service", &missing) {
+        Err(err) => err.to_string(),
+        Ok(_) => panic!("expected the catalog push to fail"),
+    };
+    assert!(
+        message.contains(&missing.display().to_string()),
+        "unexpected: {message}"
+    );
+}
+
+#[test]
+fn a_relative_catalog_info_resolves_next_to_the_config() {
+    let dir = test_dir("catalog_elsewhere/project");
+    let file = catalog_file("catalog_elsewhere/project");
+    let config_path = dir.join("sanshain.yaml");
+    if let Err(err) = std::fs::write(
+        &config_path,
+        "serviceName: orders-service\ncatalogInfo: catalog-info.yaml\n",
+    ) {
+        panic!("failed to write config: {err}");
+    }
+    let config = match Config::from_yaml_file(&config_path) {
+        Ok(config) => config,
+        Err(err) => panic!("config should load: {err}"),
+    };
+    assert_eq!(config.catalog_info.as_deref(), Some(file.as_path()));
+
+    let (url, handle) = mock_server(vec![catalog_ok_response(false)]);
+    let client = Client::new(url.as_str(), None);
+    let Some(catalog_info) = config.catalog_info.as_deref() else {
+        panic!("catalogInfo should be set");
+    };
+    if let Err(err) = client.catalog("orders-service", catalog_info) {
+        panic!("catalog failed: {err}");
+    }
+    let requests = joined_requests(handle);
+    assert!(
+        json_body(&requests[0])["catalog_info_yaml"]
+            .as_str()
+            .is_some_and(|yaml| yaml.contains("kind: Component"))
     );
 }

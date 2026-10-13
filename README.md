@@ -10,7 +10,7 @@ pinned to an exact version.
 
 | Crate                                | What it is                                              |
 |--------------------------------------|---------------------------------------------------------|
-| [`sanshain`](sanshain)               | The client library — configuration, and a `Client` that provides, requires and retires. |
+| [`sanshain`](sanshain)               | The client library — configuration, and a `Client` that provides, requires, retires and pushes the catalog. |
 | [`cargo-sanshain`](cargo-sanshain)   | The `cargo sanshain` subcommand wrapping it for builds. |
 
 ## Install
@@ -26,6 +26,7 @@ $ cargo install cargo-sanshain
 ```yaml
 serviceName: gateway-service
 sanshainUrl: http://localhost:3000   # better: set SANSHAIN_URL in the environment
+catalogInfo: catalog-info.yaml       # optional: Backstage file for `cargo sanshain catalog`
 
 provides:
   - file: specs/openapi.yaml         # version read from info.version
@@ -49,7 +50,11 @@ requires:
 $ cargo sanshain provide          # snapshot (the default)
 $ cargo sanshain provide --ga     # immutable GA release
 $ cargo sanshain require          # download the pinned snippets
+$ cargo sanshain catalog          # push catalog-info.yaml (needs Sanshain Service 2.4.0+)
 ```
+
+Relative paths in `sanshain.yaml` resolve against the directory containing it. `catalog`
+needs Sanshain Service 2.4.0 or later; every other command works with any 2.x service.
 
 See the [library README](sanshain/README.md) for the configuration reference and the API,
 and the [subcommand README](cargo-sanshain/README.md) for the flags and CI recipes.

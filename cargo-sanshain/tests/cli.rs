@@ -420,3 +420,173 @@ fn unknown_fields_fail_under_strict_even_with_best_effort() {
         "unexpected stderr: {err}"
     );
 }
+
+// --- catalog ---
+
+fn catalog_project(name: &str, url: &str, extra_yaml: &str) -> PathBuf {
+    let dir = project(name);
+    write(
+        &dir.join("catalog-info.yaml"),
+        "apiVersion: backstage.io/v1alpha1\nkind: Component\nmetadata:\n  name: orders-service\n",
+    );
+    write(
+        &dir.join("sanshain.yaml"),
+        &format!("serviceName: orders-service\nsanshainUrl: {url}\n{extra_yaml}"),
+    );
+    dir
+}
+
+#[test]
+fn catalog_prints_the_recorded_resources() {
+    let (url, handle) = mock_server(vec![http_response(
+        "200 OK",
+        r#"{"system":"orders-service","trunk":true,"resources":["resource:default/orders-db","resource:default/orders-bucket"]}"#,
+    )]);
+    let dir = catalog_project("catalog_ok", &url, "catalogInfo: catalog-info.yaml\n");
+    let output = run(&dir, &["catalog", "--trunk"], &[]);
+    assert_success(&output);
+    assert_eq!(
+        stdout(&output),
+        "Catalog recorded for orders-service (main+dev): 2 resources\n  resource:default/orders-db\n  resource:default/orders-bucket\n"
+    );
+    let requests = joined_requests(handle);
+    assert!(requests[0].starts_with("PUT /catalog/orders-service "));
+    assert!(requests[0].contains(r#""trunk":true"#), "{}", requests[0]);
+}
+
+#[test]
+fn catalog_on_a_dev_build_reports_the_dev_graph() {
+    let (url, handle) = mock_server(vec![http_response(
+        "200 OK",
+        r#"{"system":"orders-service","trunk":false,"resources":[]}"#,
+    )]);
+    let dir = catalog_project("catalog_dev", &url, "catalogInfo: catalog-info.yaml\n");
+    let output = run(&dir, &["catalog"], &[]);
+    assert_success(&output);
+    assert_eq!(
+        stdout(&output),
+        "Catalog recorded for orders-service (dev): 0 resources\n"
+    );
+    let requests = joined_requests(handle);
+    assert!(!requests[0].contains("trunk"), "{}", requests[0]);
+}
+
+#[test]
+fn catalog_without_catalog_info_warns_and_skips_unless_strict() {
+    let dir = catalog_project("catalog_none", "http://127.0.0.1:9", "");
+    let output = run(&dir, &["catalog"], &[]);
+    assert_success(&output);
+    assert_eq!(
+        stderr(&output),
+        "No catalogInfo in sanshain.yaml - skipping catalog.\n"
+    );
+
+    let output = run(
+        &dir,
+        &["catalog", "--best-effort"],
+        &[("SANSHAIN_STRICT", "true")],
+    );
+    assert_failure(&output);
+    assert!(
+        stderr(&output).contains("strict: sanshain.yaml has no catalogInfo"),
+        "unexpected stderr: {}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn catalog_strict_does_not_ask_for_provides_or_requires() {
+    let (url, handle) = mock_server(vec![http_response(
+        "200 OK",
+        r#"{"system":"orders-service","trunk":false,"resources":[]}"#,
+    )]);
+    let dir = catalog_project(
+        "catalog_strict_ok",
+        &url,
+        "strict: true\ncatalogInfo: catalog-info.yaml\n",
+    );
+    assert_success(&run(&dir, &["catalog"], &[]));
+    drop(joined_requests(handle));
+}
+
+#[test]
+fn catalog_400_fails_and_best_effort_turns_it_into_a_warning() {
+    let rejected = || {
+        mock_server(vec![
+            http_response(
+                "400 Bad Request",
+                r#"{"error":"no Component named 'orders-service'"}"#,
+            ),
+            version_response("2.4.0"),
+        ])
+    };
+    let (url, handle) = rejected();
+    let dir = catalog_project("catalog_400", &url, "catalogInfo: catalog-info.yaml\n");
+    let output = run(&dir, &["catalog"], &[]);
+    assert_failure(&output);
+    assert!(
+        stderr(&output)
+            .contains("The Component's metadata.name must equal serviceName 'orders-service'."),
+        "unexpected stderr: {}",
+        stderr(&output)
+    );
+    drop(joined_requests(handle));
+
+    let (url, handle) = rejected();
+    let dir = catalog_project(
+        "catalog_400_best_effort",
+        &url,
+        "catalogInfo: catalog-info.yaml\n",
+    );
+    let output = run(&dir, &["catalog", "--best-effort"], &[]);
+    assert_success(&output);
+    let err = stderr(&output);
+    assert!(
+        err.contains("Sanshain rejected"),
+        "unexpected stderr: {err}"
+    );
+    assert!(
+        err.contains("Continuing (best effort)"),
+        "unexpected stderr: {err}"
+    );
+    drop(joined_requests(handle));
+}
+
+#[test]
+fn catalog_on_a_pre_2_4_service_says_so() {
+    let (url, handle) = mock_server(vec![
+        http_response("404 Not Found", ""),
+        version_response("2.3.0"),
+    ]);
+    let dir = catalog_project("catalog_404", &url, "catalogInfo: catalog-info.yaml\n");
+    let output = run(&dir, &["catalog"], &[]);
+    assert_failure(&output);
+    assert!(
+        stderr(&output)
+            .contains("sanshain catalog needs Sanshain Service 2.4.0 or later (server is 2.3.0)"),
+        "unexpected stderr: {}",
+        stderr(&output)
+    );
+    drop(joined_requests(handle));
+}
+
+#[test]
+fn catalog_with_a_missing_file_names_the_resolved_path() {
+    let dir = catalog_project(
+        "catalog_missing",
+        "http://127.0.0.1:9",
+        "catalogInfo: docs/catalog.yaml\n",
+    );
+    let output = run(&dir, &["catalog"], &[]);
+    assert_failure(&output);
+    // The config is the working directory's own, so the resolved path is the
+    // configured one; wire.rs covers a config in another folder.
+    assert!(
+        stderr(&output).contains("cannot read catalogInfo docs/catalog.yaml"),
+        "unexpected stderr: {}",
+        stderr(&output)
+    );
+    let output = run(&dir, &["catalog"], &[("SANSHAIN_BEST_EFFORT", "true")]);
+    assert_success(&output);
+    assert!(stderr(&output).contains("docs/catalog.yaml"));
+}

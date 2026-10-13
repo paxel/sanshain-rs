@@ -43,6 +43,13 @@ enum Commands {
         #[command(flatten)]
         stream: StreamArgs,
     },
+    /// Push the Backstage catalog-info.yaml named by catalogInfo, so the graph
+    /// shows the peripheral resources this system depends on (needs Sanshain
+    /// Service 2.4.0 or later)
+    Catalog {
+        #[command(flatten)]
+        stream: StreamArgs,
+    },
 }
 
 /// Which graph this build's calls belong to. Declared by the pipeline, never
@@ -122,6 +129,7 @@ fn main() -> anyhow::Result<()> {
     match args.command {
         Commands::Provide { ga, stream } => provide(&config, &mode, ga, &stream),
         Commands::Require { stream } => require(&config, &mode, &stream),
+        Commands::Catalog { stream } => catalog(&config, &mode, &stream),
     }
 }
 
@@ -131,9 +139,12 @@ fn skip(mode: &Mode, missing: &str, command: &str) -> anyhow::Result<()> {
     if mode.strict {
         bail!("strict: {CONFIG_FILE} has no {missing}");
     }
-    eprintln!(
-        "No {missing} in {CONFIG_FILE} - skipping {command}. Set strict: true to fail in this case."
-    );
+    let hint = if command == "catalog" {
+        ""
+    } else {
+        " Set strict: true to fail in this case."
+    };
+    eprintln!("No {missing} in {CONFIG_FILE} - skipping {command}.{hint}");
     Ok(())
 }
 
@@ -273,4 +284,30 @@ fn require(config: &Config, mode: &Mode, stream: &StreamArgs) -> anyhow::Result<
         }
     }
     Ok(())
+}
+
+/// Strict checks only `serviceName` and `catalogInfo` here: a project with no
+/// provides or requires still has a periphery worth recording.
+fn catalog(config: &Config, mode: &Mode, stream: &StreamArgs) -> anyhow::Result<()> {
+    let Some(service_name) = config.service_name.as_deref() else {
+        return skip(mode, "serviceName", "catalog");
+    };
+    let Some(catalog_info) = config.catalog_info.as_deref() else {
+        return skip(mode, "catalogInfo", "catalog");
+    };
+    let push = || -> anyhow::Result<()> {
+        let client = Client::from_config(config)?.with_stream(stream.resolve()?);
+        let recorded = client.catalog(service_name, catalog_info)?;
+        let graphs = if recorded.trunk { "main+dev" } else { "dev" };
+        println!(
+            "Catalog recorded for {} ({graphs}): {} resources",
+            recorded.system,
+            recorded.resources.len()
+        );
+        for resource in &recorded.resources {
+            println!("  {resource}");
+        }
+        Ok(())
+    };
+    soften(mode, push())
 }

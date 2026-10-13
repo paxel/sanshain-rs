@@ -2,7 +2,8 @@
 //! (OpenAPI, AsyncAPI, gRPC/Proto) under a producer-declared version, and
 //! **require** pinned endpoint snippets.
 //!
-//! Compatibility: **sanshain 2.x speaks Sanshain Service 2.x.**
+//! Compatibility: **sanshain 2.x speaks Sanshain Service 2.x.** Only
+//! [`Client::catalog`] needs Sanshain Service 2.4.0 or later.
 //!
 //! Configuration lives in `sanshain.yaml`, the same file every other Sanshain
 //! client reads.
@@ -352,6 +353,9 @@ pub struct Config {
     /// `bestEffort` from `sanshain.yaml`: failed calls become warnings. See
     /// [`BEST_EFFORT_ENV_VAR`].
     pub best_effort: bool,
+    /// `catalogInfo`: the project's Backstage `catalog-info.yaml`, pushed by
+    /// [`Client::catalog`].
+    pub catalog_info: Option<PathBuf>,
     /// Fields no Sanshain client knows, as paths in file order
     /// (`provides[1].verison`). Parsing ignores them; see [`puzzled_cat`].
     pub unknown_fields: Vec<String>,
@@ -371,6 +375,7 @@ struct RawConfig {
     strict: bool,
     #[serde(default)]
     best_effort: bool,
+    catalog_info: Option<PathBuf>,
 }
 
 /// Config fields removed in the 2.0 model, rejected by name with a migration hint.
@@ -559,7 +564,7 @@ fn is_pinnable_version(version: &str) -> bool {
 impl Config {
     /// Loads configuration from a `sanshain.yaml` file.
     ///
-    /// Every relative path in it (`file`, `outputDirectory`) is resolved
+    /// Every relative path in it (`file`, `outputDirectory`, `catalogInfo`) is resolved
     /// against the directory containing the file, never the working directory,
     /// so a build pointed at a config elsewhere finds the same files as one
     /// started next to it. Absolute paths stay as they are.
@@ -586,6 +591,9 @@ impl Config {
         }
         for entry in &mut self.requires {
             entry.output_directory = dir.join(&entry.output_directory);
+        }
+        if let Some(catalog_info) = &mut self.catalog_info {
+            *catalog_info = dir.join(&*catalog_info);
         }
     }
 
@@ -672,6 +680,7 @@ impl Config {
             requires: raw.requires,
             strict: raw.strict,
             best_effort: raw.best_effort,
+            catalog_info: raw.catalog_info,
             unknown_fields: unknown_fields(obj),
         })
     }
@@ -955,6 +964,72 @@ pub(crate) fn require_error_message(
     }
 }
 
+/// What the server recorded for a catalog push.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CatalogResponse {
+    pub system: String,
+    /// Whether the main graph was updated as well as the dev graph.
+    pub trunk: bool,
+    /// The recorded refs, `resource:<namespace>/<name>`, lower-cased and sorted.
+    pub resources: Vec<String>,
+}
+
+/// Builds the JSON payload for a catalog push. `trunk` appears only for a
+/// trunk build, and a tag never does: the payload denies unknown fields.
+pub(crate) fn catalog_payload(content: &str, stream: &Stream) -> Value {
+    let mut payload = json!({ "catalog_info_yaml": content });
+    if stream.is_trunk() {
+        if let Some(map) = payload.as_object_mut() {
+            map.insert("trunk".to_string(), Value::Bool(true));
+        }
+    }
+    payload
+}
+
+/// Formats a failed catalog push. A `400` is almost always a Component whose
+/// `metadata.name` is not the `serviceName`; a `404` means the service
+/// predates the catalog endpoint.
+pub(crate) fn catalog_error_message(
+    status: u16,
+    body: &str,
+    catalog_info: &Path,
+    service_name: &str,
+    server_version: Option<&str>,
+) -> String {
+    let parsed: Option<ErrorBody> = serde_json::from_str(body).ok();
+    let server_message = parsed.map_or_else(|| fallback_message(body), |b| b.error);
+    match status {
+        400 => format!(
+            "Sanshain rejected {}: {server_message}. The Component's metadata.name must equal serviceName '{service_name}'.",
+            catalog_info.display()
+        ),
+        404 => match server_version {
+            Some(version) => format!(
+                "sanshain catalog needs Sanshain Service 2.4.0 or later (server is {version})"
+            ),
+            None => {
+                "sanshain catalog needs Sanshain Service 2.4.0 or later (server version unknown)"
+                    .to_string()
+            }
+        },
+        _ => format!("catalog failed ({status}): {server_message}"),
+    }
+}
+
+/// Percent-encodes one URL path segment, keeping only RFC 3986 unreserved
+/// characters as they are.
+fn encode_path_segment(segment: &str) -> String {
+    let mut encoded = String::with_capacity(segment.len());
+    for byte in segment.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
 /// If the reported instance version is pre-2.0, the message that replaces the
 /// original (confusing) error.
 pub(crate) fn wrong_server_message(base_url: &str, reported: &str) -> Option<String> {
@@ -1037,7 +1112,7 @@ impl Client {
         let url = format!("{}{}", self.base_url, entry.api_type.provide_path());
         match self.with_auth(ureq::post(&url)).send_json(payload) {
             Ok(response) => Ok(response.into_json()?),
-            Err(err) => Err(self.map_failure(err, |status, body| {
+            Err(err) => Err(self.map_failure(err, |status, body, _| {
                 provide_error_message(status, body, entry.api_type, &entry.file)
             })),
         }
@@ -1061,7 +1136,7 @@ impl Client {
             .send_json(retire_payload(producername))
         {
             Ok(response) => Ok(response.into_json()?),
-            Err(err) => Err(self.map_failure(err, |status, body| {
+            Err(err) => Err(self.map_failure(err, |status, body, _| {
                 retire_error_message(status, body, producername)
             })),
         }
@@ -1097,37 +1172,72 @@ impl Client {
                 fs::write(&out, body)?;
                 Ok(out)
             }
-            Err(err) => Err(self.map_failure(err, |status, body| {
+            Err(err) => Err(self.map_failure(err, |status, body, _| {
                 require_error_message(status, body, entry, &self.base_url)
+            })),
+        }
+    }
+
+    /// Pushes the project's Backstage `catalog-info.yaml` with
+    /// `PUT /catalog/<serviceName>`, so the network graph shows the peripheral
+    /// resources the system depends on. Returns what the server recorded.
+    ///
+    /// Only a trunk stream is sent (`trunk: true` updates the main graph as
+    /// well as the dev graph); a tag is never sent — the server refuses
+    /// unknown fields. Needs Sanshain Service 2.4.0 or later: an older 2.x
+    /// service answers `404`, reported as such.
+    pub fn catalog(&self, service_name: &str, catalog_info: &Path) -> Result<CatalogResponse> {
+        let content = fs::read_to_string(catalog_info).map_err(|e| {
+            Error::Config(format!(
+                "cannot read catalogInfo {}: {e}",
+                catalog_info.display()
+            ))
+        })?;
+        let url = format!(
+            "{}/catalog/{}",
+            self.base_url,
+            encode_path_segment(service_name)
+        );
+        match self
+            .with_auth(ureq::put(&url))
+            .send_json(catalog_payload(&content, &self.stream))
+        {
+            Ok(response) => Ok(response.into_json()?),
+            Err(err) => Err(self.map_failure(err, |status, body, server_version| {
+                catalog_error_message(status, body, catalog_info, service_name, server_version)
             })),
         }
     }
 
     /// On any failure, does one lazy `GET /version`: a pre-2.0 instance replaces
     /// the confusing error with a clear upgrade message. There is no preflight —
-    /// successful calls never trigger this.
+    /// successful calls never trigger this. `describe` also gets the reported
+    /// version, when the server named one.
     fn map_failure<F>(&self, err: ureq::Error, describe: F) -> Error
     where
-        F: FnOnce(u16, &str) -> String,
+        F: FnOnce(u16, &str, Option<&str>) -> String,
     {
-        if let Some(message) = self.wrong_server_diagnosis() {
+        let server_version = self.server_version();
+        if let Some(message) = server_version
+            .as_deref()
+            .and_then(|reported| wrong_server_message(&self.base_url, reported))
+        {
             return Error::WrongServer(message);
         }
         match err {
             ureq::Error::Status(status, response) => {
                 let body = response.into_string().unwrap_or_default();
-                Error::Api(describe(status, &body))
+                Error::Api(describe(status, &body, server_version.as_deref()))
             }
             transport => Error::Http(transport.to_string()),
         }
     }
 
-    fn wrong_server_diagnosis(&self) -> Option<String> {
+    fn server_version(&self) -> Option<String> {
         let url = format!("{}/version", self.base_url);
         let response = self.with_auth(ureq::get(&url)).call().ok()?;
         let body: Value = response.into_json().ok()?;
-        let reported = body.get("version")?.as_str()?;
-        wrong_server_message(&self.base_url, reported)
+        Some(body.get("version")?.as_str()?.to_string())
     }
 }
 
@@ -1508,6 +1618,64 @@ requires:
             }
             other => panic!("expected the legacy error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn catalog_payload_sends_trunk_only_for_trunk_and_never_a_tag() {
+        let trunk = catalog_payload("kind: Component", &Stream::Trunk);
+        assert_eq!(
+            trunk,
+            json!({ "catalog_info_yaml": "kind: Component", "trunk": true })
+        );
+        let plain = catalog_payload("kind: Component", &Stream::None);
+        assert_eq!(plain, json!({ "catalog_info_yaml": "kind: Component" }));
+        let tagged = catalog_payload("kind: Component", &Stream::Tag("R".to_string()));
+        assert_eq!(tagged, json!({ "catalog_info_yaml": "kind: Component" }));
+    }
+
+    #[test]
+    fn catalog_errors_name_the_fix() {
+        let file = Path::new("/p/catalog-info.yaml");
+        assert_eq!(
+            catalog_error_message(
+                400,
+                r#"{"error":"no Component named 'svc'"}"#,
+                file,
+                "svc",
+                Some("2.4.0")
+            ),
+            "Sanshain rejected /p/catalog-info.yaml: no Component named 'svc'. The Component's metadata.name must equal serviceName 'svc'."
+        );
+        assert_eq!(
+            catalog_error_message(404, "", file, "svc", Some("2.3.1")),
+            "sanshain catalog needs Sanshain Service 2.4.0 or later (server is 2.3.1)"
+        );
+        assert_eq!(
+            catalog_error_message(404, "", file, "svc", None),
+            "sanshain catalog needs Sanshain Service 2.4.0 or later (server version unknown)"
+        );
+        assert_eq!(
+            catalog_error_message(413, r#"{"error":"too large"}"#, file, "svc", None),
+            "catalog failed (413): too large"
+        );
+    }
+
+    #[test]
+    fn path_segments_are_percent_encoded() {
+        assert_eq!(
+            encode_path_segment("orders-service_1.x~"),
+            "orders-service_1.x~"
+        );
+        assert_eq!(encode_path_segment("a b/c?ä"), "a%20b%2Fc%3F%C3%A4");
+    }
+
+    #[test]
+    fn catalog_info_loads_from_yaml() {
+        let config = Config::from_yaml_str("serviceName: s\ncatalogInfo: catalog-info.yaml\n").ok();
+        assert_eq!(
+            config.and_then(|c| c.catalog_info),
+            Some(PathBuf::from("catalog-info.yaml"))
+        );
     }
 
     #[test]

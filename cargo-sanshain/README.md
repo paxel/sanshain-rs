@@ -50,11 +50,33 @@ does not soften that.
 $ cargo sanshain provide          # publish as a snapshot (the default)
 $ cargo sanshain provide --ga     # publish as an immutable GA release
 $ cargo sanshain require          # download the pinned snippets
+$ cargo sanshain catalog          # push the Backstage catalog-info.yaml
 ```
 
 `require` writes one file per entry into its `outputDirectory`. A single endpoint is fetched
 with `GET /require`; several arrive as one merged specification via `POST /require-bundle`,
 so shared schemas are emitted once and generated types stay shared.
+
+`catalog` pushes the Backstage file named by `catalogInfo` in `sanshain.yaml` (resolved
+like every path there) with `PUT /catalog/<serviceName>`, so the network graph shows the
+peripheral resources — databases, buckets, queues — the system depends on:
+
+```yaml
+catalogInfo: catalog-info.yaml
+```
+
+```console
+$ cargo sanshain catalog --trunk
+Catalog recorded for orders-service (main+dev): 1 resources
+  resource:default/orders-db
+```
+
+A trunk build (`--trunk` / `SANSHAIN_TRUNK`) updates the main graph and the dev graph; any
+other build only the dev graph. Without `catalogInfo` it warns and skips (fails under strict;
+strict checks only `serviceName` and `catalogInfo` here). A `400` means Sanshain could not read
+the file as this project's Component — usually its `metadata.name` is not the `serviceName`.
+**`catalog` needs Sanshain Service 2.4.0 or later**; an older service answers `404`, reported as
+such. Every other command works with any 2.x service.
 
 ## Flags and environment
 
@@ -108,6 +130,7 @@ A set environment variable overrides the `sanshain.yaml` value either way
 # trunk pipeline
 - run: cargo sanshain require --trunk
 - run: cargo sanshain provide --trunk --ga
+- run: cargo sanshain catalog --trunk      # needs Sanshain Service 2.4.0+
 
 # release-branch hotfix
 - run: cargo sanshain provide --tag "Release-Maribou" --ga
