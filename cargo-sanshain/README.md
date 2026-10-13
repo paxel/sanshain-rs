@@ -4,7 +4,7 @@ The `cargo sanshain` subcommand: publish this crate's API specifications to a
 [Sanshain Service](https://github.com/paxel/sanshain-service), and download the pinned
 endpoint snippets it depends on, as part of the build.
 
-**Compatibility: `cargo-sanshain` 2.x speaks Sanshain Service 2.x.** The library behind it
+**Compatibility: `cargo-sanshain` 3.x speaks Sanshain Service 2.x.** The library behind it
 is [`sanshain`](https://crates.io/crates/sanshain).
 
 ```console

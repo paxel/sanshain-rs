@@ -5,7 +5,7 @@ Client library for the [Sanshain Service](https://github.com/paxel/sanshain-serv
 producer-declared version, **require** pinned endpoint snippets, and **retire** a protocol
 family you no longer publish.
 
-**Compatibility: `sanshain` 2.x speaks Sanshain Service 2.x.** For the command line, see
+**Compatibility: `sanshain` 3.x speaks Sanshain Service 2.x.** For the command line, see
 [`cargo-sanshain`](https://crates.io/crates/cargo-sanshain).
 
 ```rust,no_run

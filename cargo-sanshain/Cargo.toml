@@ -15,5 +15,5 @@ repository.workspace = true
 clap = { version = "4.4", features = ["derive"] }
 # Both fields are required: `cargo publish` strips `path` and resolves the
 # dependency from the registry by `version`.
-sanshain = { version = "2.1.0", path = "../sanshain" }
+sanshain = { version = "3.0.0", path = "../sanshain" }
 anyhow = "1.0"
