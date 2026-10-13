@@ -12,10 +12,13 @@ family you no longer publish.
 use sanshain::{CONFIG_FILE, Client, Config, Stability, Stream};
 
 let config = Config::from_yaml_file(CONFIG_FILE)?;
+let Some(service_name) = config.service_name.as_deref() else {
+    return Ok(()); // no serviceName: nothing to provide as
+};
 let client = Client::from_config(&config)?.with_stream(Stream::Trunk);
 
 for entry in &config.provides {
-    let stored = client.provide(&config.service_name, entry, Stability::Snapshot)?;
+    let stored = client.provide(service_name, entry, Stability::Snapshot)?;
     println!("stored {} ({})", stored.version, stored.stability);
 }
 # Ok::<(), sanshain::Error>(())
@@ -56,6 +59,10 @@ requires:
 - Relative paths (`file`, `outputDirectory`) resolve against the directory containing
   `sanshain.yaml` when it is loaded with [`Config::from_yaml_file`], never against the working
   directory. Absolute paths stay absolute.
+- `strict: true` and `bestEffort: true` are read into [`Config::strict`] and
+  [`Config::best_effort`] for the command to act on; `SANSHAIN_STRICT` /
+  `SANSHAIN_BEST_EFFORT`, when set, override them ([`resolve_switch_with`]). A missing
+  `serviceName` parses as `None` — the command decides whether that skips or fails.
 - Configuration is validated before any network call; removed 1.x-era fields (`branch`,
   `timeout`, `baseVersion`, `releaseBranches`, `stability`, `spec_id`, `api_key`,
   `service_url`) are rejected by name with a migration hint.

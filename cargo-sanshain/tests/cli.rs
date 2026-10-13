@@ -1,0 +1,382 @@
+//! End-to-end tests of the `cargo sanshain` binary: a project folder with a
+//! `sanshain.yaml`, the binary run inside it, and a minimal in-process HTTP
+//! server standing in for Sanshain. They check what users see — exit status,
+//! stdout and stderr — for strict, best-effort and the other run modes.
+
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+use std::thread::JoinHandle;
+
+/// Serves the canned responses to sequential connections (one request per
+/// connection) and returns the base URL plus a handle yielding the raw requests.
+fn mock_server(responses: Vec<String>) -> (String, JoinHandle<Vec<String>>) {
+    let listener = match TcpListener::bind("127.0.0.1:0") {
+        Ok(listener) => listener,
+        Err(err) => panic!("failed to bind mock server: {err}"),
+    };
+    let addr = match listener.local_addr() {
+        Ok(addr) => addr,
+        Err(err) => panic!("failed to read mock server address: {err}"),
+    };
+    let handle = std::thread::spawn(move || {
+        let mut requests = Vec::new();
+        for response in responses {
+            let (mut stream, _) = match listener.accept() {
+                Ok(accepted) => accepted,
+                Err(err) => panic!("mock server accept failed: {err}"),
+            };
+            requests.push(read_request(&mut stream));
+            if let Err(err) = stream.write_all(response.as_bytes()) {
+                panic!("mock server write failed: {err}");
+            }
+        }
+        requests
+    });
+    (format!("http://{addr}"), handle)
+}
+
+/// Reads one HTTP request (headers plus a Content-Length body) as a string.
+fn read_request(stream: &mut std::net::TcpStream) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        let n = match stream.read(&mut chunk) {
+            Ok(n) => n,
+            Err(err) => panic!("mock server read failed: {err}"),
+        };
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let headers = String::from_utf8_lossy(&buf[..header_end]).to_string();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())?
+                })
+                .unwrap_or(0);
+            let total = header_end + 4 + content_length;
+            while buf.len() < total {
+                let n = match stream.read(&mut chunk) {
+                    Ok(n) => n,
+                    Err(err) => panic!("mock server read failed: {err}"),
+                };
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            return String::from_utf8_lossy(&buf[..buf.len().min(total)]).to_string();
+        }
+        if n == 0 {
+            return String::from_utf8_lossy(&buf).to_string();
+        }
+    }
+}
+
+fn http_response(status_line: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+fn version_response(version: &str) -> String {
+    http_response(
+        "200 OK",
+        &format!(r#"{{"version":"{version}","instance_id":"test"}}"#),
+    )
+}
+
+fn conflict_response() -> String {
+    http_response(
+        "409 Conflict",
+        r#"{"error":"GA 1.4.0 already exists with different content","proposed_version":"1.5.0"}"#,
+    )
+}
+
+fn joined_requests(handle: JoinHandle<Vec<String>>) -> Vec<String> {
+    match handle.join() {
+        Ok(requests) => requests,
+        Err(_) => panic!("mock server thread panicked"),
+    }
+}
+
+/// A fresh, empty project folder for one test.
+fn project(name: &str) -> PathBuf {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("cli")
+        .join(name);
+    if dir.exists() {
+        if let Err(err) = std::fs::remove_dir_all(&dir) {
+            panic!("failed to clear {}: {err}", dir.display());
+        }
+    }
+    if let Err(err) = std::fs::create_dir_all(&dir) {
+        panic!("failed to create {}: {err}", dir.display());
+    }
+    dir
+}
+
+fn write(path: &Path, content: &str) {
+    if let Some(parent) = path.parent() {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            panic!("failed to create {}: {err}", parent.display());
+        }
+    }
+    if let Err(err) = std::fs::write(path, content) {
+        panic!("failed to write {}: {err}", path.display());
+    }
+}
+
+fn write_spec(dir: &Path) {
+    write(
+        &dir.join("specs/openapi.yaml"),
+        "openapi: 3.0.3\ninfo:\n  title: Demo\n  version: 1.4.0\npaths: {}\n",
+    );
+}
+
+/// Runs `cargo sanshain <args>` in `dir` with only the given `SANSHAIN_*`
+/// variables set — the developer's own environment must not leak in.
+fn run(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-sanshain"));
+    command.arg("sanshain").args(args).current_dir(dir);
+    for (key, _) in std::env::vars() {
+        if key.starts_with("SANSHAIN_") {
+            command.env_remove(key);
+        }
+    }
+    command.envs(envs.iter().copied());
+    match command.output() {
+        Ok(output) => output,
+        Err(err) => panic!("failed to run cargo-sanshain: {err}"),
+    }
+}
+
+fn stdout(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+fn stderr(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).to_string()
+}
+
+fn assert_success(output: &Output) {
+    assert!(
+        output.status.success(),
+        "expected success, got {:?}\nstdout: {}\nstderr: {}",
+        output.status,
+        stdout(output),
+        stderr(output)
+    );
+}
+
+fn assert_failure(output: &Output) {
+    assert!(
+        !output.status.success(),
+        "expected failure\nstdout: {}\nstderr: {}",
+        stdout(output),
+        stderr(output)
+    );
+}
+
+// --- strict ---
+
+#[test]
+fn missing_service_name_warns_and_skips() {
+    let dir = project("no_service_name");
+    write(
+        &dir.join("sanshain.yaml"),
+        "provides:\n  - file: specs/openapi.yaml\n",
+    );
+    for command in ["provide", "require"] {
+        let output = run(&dir, &[command], &[]);
+        assert_success(&output);
+        assert!(
+            stderr(&output).contains(&format!(
+                "No serviceName in sanshain.yaml - skipping {command}."
+            )),
+            "unexpected stderr: {}",
+            stderr(&output)
+        );
+    }
+}
+
+#[test]
+fn missing_service_name_fails_under_strict_from_yaml_or_environment() {
+    let dir = project("no_service_name_strict");
+    write(
+        &dir.join("sanshain.yaml"),
+        "strict: true\nprovides:\n  - file: specs/openapi.yaml\n",
+    );
+    let output = run(&dir, &["provide"], &[]);
+    assert_failure(&output);
+    assert!(
+        stderr(&output).contains("strict: sanshain.yaml has no serviceName"),
+        "unexpected stderr: {}",
+        stderr(&output)
+    );
+
+    write(
+        &dir.join("sanshain.yaml"),
+        "provides:\n  - file: specs/openapi.yaml\n",
+    );
+    assert_failure(&run(&dir, &["require"], &[("SANSHAIN_STRICT", "1")]));
+    // A set environment variable decides either way.
+    write(
+        &dir.join("sanshain.yaml"),
+        "strict: true\nprovides:\n  - file: specs/openapi.yaml\n",
+    );
+    assert_success(&run(&dir, &["provide"], &[("SANSHAIN_STRICT", "false")]));
+}
+
+#[test]
+fn nothing_to_provide_or_require_warns_and_skips_unless_strict() {
+    let dir = project("nothing_configured");
+    write(&dir.join("sanshain.yaml"), "serviceName: demo-service\n");
+
+    let provide = run(&dir, &["provide"], &[]);
+    assert_success(&provide);
+    assert!(
+        stderr(&provide)
+            .contains("No provide/provides entries in sanshain.yaml - skipping provide."),
+        "unexpected stderr: {}",
+        stderr(&provide)
+    );
+    let require = run(&dir, &["require"], &[]);
+    assert_success(&require);
+    assert!(
+        stderr(&require).contains("No requires entries in sanshain.yaml - skipping require."),
+        "unexpected stderr: {}",
+        stderr(&require)
+    );
+
+    let strict = [("SANSHAIN_STRICT", " TRUE ")];
+    let provide = run(&dir, &["provide"], &strict);
+    assert_failure(&provide);
+    assert!(stderr(&provide).contains("strict: sanshain.yaml has no provide/provides entries"));
+    let require = run(&dir, &["require"], &strict);
+    assert_failure(&require);
+    assert!(stderr(&require).contains("strict: sanshain.yaml has no requires entries"));
+}
+
+// --- best effort ---
+
+/// Test name, arguments, environment, extra `sanshain.yaml` lines.
+type BestEffortCase = (
+    &'static str,
+    &'static [&'static str],
+    &'static [(&'static str, &'static str)],
+    &'static str,
+);
+
+#[test]
+fn a_failed_provide_fails_the_build_by_default() {
+    let dir = project("provide_fails");
+    write_spec(&dir);
+    let (url, handle) = mock_server(vec![conflict_response(), version_response("2.3.0")]);
+    write(
+        &dir.join("sanshain.yaml"),
+        &format!(
+            "serviceName: demo-service\nsanshainUrl: {url}\nprovides:\n  - file: specs/openapi.yaml\n"
+        ),
+    );
+    let output = run(&dir, &["provide"], &[]);
+    assert_failure(&output);
+    assert!(stderr(&output).contains("Publish as 1.5.0"));
+    drop(joined_requests(handle));
+}
+
+#[test]
+fn best_effort_turns_a_failed_provide_into_a_warning_from_flag_env_or_yaml() {
+    let cases: [BestEffortCase; 4] = [
+        ("be_flag_before", &["--best-effort", "provide"], &[], ""),
+        ("be_flag_after", &["provide", "--best-effort"], &[], ""),
+        ("be_env", &["provide"], &[("SANSHAIN_BEST_EFFORT", "1")], ""),
+        ("be_yaml", &["provide"], &[], "bestEffort: true\n"),
+    ];
+    for (name, args, envs, extra_yaml) in cases {
+        let dir = project(name);
+        write_spec(&dir);
+        let (url, handle) = mock_server(vec![conflict_response(), version_response("2.3.0")]);
+        write(
+            &dir.join("sanshain.yaml"),
+            &format!(
+                "serviceName: demo-service\nsanshainUrl: {url}\n{extra_yaml}provides:\n  - file: specs/openapi.yaml\n"
+            ),
+        );
+        let output = run(&dir, args, envs);
+        assert_success(&output);
+        let err = stderr(&output);
+        assert!(err.contains("Publish as 1.5.0"), "{name}: {err}");
+        assert!(err.contains("Continuing (best effort)"), "{name}: {err}");
+        drop(joined_requests(handle));
+    }
+}
+
+#[test]
+fn best_effort_skips_a_missing_spec_file_and_provides_the_rest() {
+    let dir = project("be_missing_spec");
+    write_spec(&dir);
+    let (url, handle) = mock_server(vec![http_response(
+        "202 Accepted",
+        r#"{"version":"1.4.0","stability":"snapshot","content_hash":"sha256:abc","changes":{"inserts":1,"updates":0,"deletes":0}}"#,
+    )]);
+    write(
+        &dir.join("sanshain.yaml"),
+        &format!(
+            "serviceName: demo-service\nsanshainUrl: {url}\nprovides:\n  - file: specs/missing.yaml\n  - file: specs/openapi.yaml\n"
+        ),
+    );
+    let output = run(&dir, &["provide", "--best-effort"], &[]);
+    assert_success(&output);
+    assert!(stderr(&output).contains("Spec file not found"));
+    assert!(stdout(&output).contains("Stored version 1.4.0"));
+    assert_eq!(joined_requests(handle).len(), 1);
+
+    let output = run(&dir, &["provide"], &[]);
+    assert_failure(&output);
+    assert!(stderr(&output).contains("Spec file not found"));
+}
+
+#[test]
+fn best_effort_require_carries_on_with_the_next_entry() {
+    let dir = project("be_require");
+    let (url, handle) = mock_server(vec![
+        http_response("404 Not Found", r#"{"error":"no version 9.9.9"}"#),
+        version_response("2.3.0"),
+        http_response("200 OK", "openapi: 3.0.3\n"),
+    ]);
+    write(
+        &dir.join("sanshain.yaml"),
+        &format!(
+            "serviceName: demo-service\nsanshainUrl: {url}\nrequires:\n  - serviceName: ghost\n    version: 9.9.9\n    outputDirectory: out\n    endpoints:\n      - method: GET\n        path: /x\n  - serviceName: user-service\n    version: 1.2.0\n    outputDirectory: out\n    endpoints:\n      - method: GET\n        path: /y\n"
+        ),
+    );
+    let output = run(&dir, &["require"], &[("SANSHAIN_BEST_EFFORT", "true")]);
+    assert_success(&output);
+    assert!(stderr(&output).contains("Error requiring ghost 9.9.9"));
+    assert!(dir.join("out/user-service.yaml").exists());
+    drop(joined_requests(handle));
+}
+
+#[test]
+fn best_effort_does_not_soften_strict() {
+    let dir = project("be_and_strict");
+    write(
+        &dir.join("sanshain.yaml"),
+        "serviceName: demo-service\nstrict: true\n",
+    );
+    assert_failure(&run(&dir, &["provide", "--best-effort"], &[]));
+}
+
+#[test]
+fn an_unloadable_config_is_a_warning_only_with_best_effort_from_flag_or_env() {
+    let dir = project("no_config");
+    assert_failure(&run(&dir, &["provide"], &[]));
+    let output = run(&dir, &["provide"], &[("SANSHAIN_BEST_EFFORT", "1")]);
+    assert_success(&output);
+    assert!(stderr(&output).contains("Warning loading config"));
+}

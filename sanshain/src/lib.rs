@@ -28,6 +28,12 @@ pub const TOKEN_ENV_VAR: &str = "SANSHAIN_TOKEN";
 pub const TRUNK_ENV_VAR: &str = "SANSHAIN_TRUNK";
 /// Environment variable naming the sanshain-branch this build belongs to.
 pub const TAG_ENV_VAR: &str = "SANSHAIN_TAG";
+/// Environment variable turning "warn and skip" on missing configuration into
+/// a failure (`true` or `1`); overrides `strict` in `sanshain.yaml` when set.
+pub const STRICT_ENV_VAR: &str = "SANSHAIN_STRICT";
+/// Environment variable turning failed calls into warnings (`true` or `1`);
+/// overrides `bestEffort` in `sanshain.yaml` when set.
+pub const BEST_EFFORT_ENV_VAR: &str = "SANSHAIN_BEST_EFFORT";
 
 /// The default configuration file name, in the project root.
 pub const CONFIG_FILE: &str = "sanshain.yaml";
@@ -82,6 +88,19 @@ pub fn is_switch_on(value: Option<&str>) -> bool {
         let v = v.trim();
         v.eq_ignore_ascii_case("true") || v == "1"
     })
+}
+
+/// Resolves a switch that `sanshain.yaml` can also set (`strict`,
+/// `bestEffort`): an explicit flag turns it on; otherwise a set, non-empty
+/// environment variable decides, either way; otherwise the configured value.
+pub fn resolve_switch_with(flag: bool, env: Option<&str>, configured: bool) -> bool {
+    if flag {
+        return true;
+    }
+    match env {
+        Some(value) if !value.is_empty() => is_switch_on(Some(value)),
+        _ => configured,
+    }
 }
 
 /// Resolves the stability of a provide: the explicit `--ga` flag or
@@ -322,9 +341,17 @@ pub struct RequireEntry {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub sanshain_url: Option<String>,
-    pub service_name: String,
+    /// The name this project provides and requires as. Absent is not a parse
+    /// error: a command warns and skips without it, or fails under `strict`.
+    pub service_name: Option<String>,
     pub provides: Vec<ProvideEntry>,
     pub requires: Vec<RequireEntry>,
+    /// `strict` from `sanshain.yaml`: missing configuration fails instead of
+    /// warning and skipping. See [`STRICT_ENV_VAR`].
+    pub strict: bool,
+    /// `bestEffort` from `sanshain.yaml`: failed calls become warnings. See
+    /// [`BEST_EFFORT_ENV_VAR`].
+    pub best_effort: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -337,6 +364,10 @@ struct RawConfig {
     provides: Vec<ProvideEntry>,
     #[serde(default)]
     requires: Vec<RequireEntry>,
+    #[serde(default)]
+    strict: bool,
+    #[serde(default)]
+    best_effort: bool,
 }
 
 /// Config fields removed in the 2.0 model, rejected by name with a migration hint.
@@ -514,12 +545,6 @@ impl Config {
 
         let raw: RawConfig = serde_json::from_value(value.clone())
             .map_err(|e| Error::Config(format!("invalid {CONFIG_FILE}: {e}")))?;
-        let service_name = raw.service_name.ok_or_else(|| {
-            Error::Config(
-                "missing 'serviceName' — the name this project provides and requires as"
-                    .to_string(),
-            )
-        })?;
         let mut provides = Vec::new();
         if let Some(single) = raw.provide {
             provides.push(single);
@@ -527,9 +552,11 @@ impl Config {
         provides.extend(raw.provides);
         Ok(Config {
             sanshain_url: raw.sanshain_url,
-            service_name,
+            service_name: raw.service_name,
             provides,
             requires: raw.requires,
+            strict: raw.strict,
+            best_effort: raw.best_effort,
         })
     }
 }
@@ -1039,7 +1066,7 @@ mod tests {
             Ok(config) => config,
             Err(err) => panic!("expected valid config, got {err}"),
         };
-        assert_eq!(config.service_name, "gateway-service");
+        assert_eq!(config.service_name.as_deref(), Some("gateway-service"));
         assert_eq!(
             config.sanshain_url.as_deref(),
             Some("http://localhost:3000")
@@ -1215,14 +1242,40 @@ mod tests {
         );
     }
 
+    /// The command decides what a missing name means (warn and skip, or fail
+    /// under strict), so parsing accepts it.
     #[test]
-    fn missing_service_name_rejected() {
+    fn missing_service_name_parses_as_absent() {
         let value = json!({ "provides": [{ "file": "specs/openapi.yaml" }] });
-        let message = config_error(&value);
+        match Config::from_value(&value) {
+            Ok(config) => assert_eq!(config.service_name, None),
+            Err(err) => panic!("expected the config to parse, got {err}"),
+        }
+    }
+
+    #[test]
+    fn strict_and_best_effort_default_off_and_load_from_yaml() {
+        let plain = Config::from_yaml_str("serviceName: s\n").ok();
         assert_eq!(
-            message,
-            "missing 'serviceName' — the name this project provides and requires as"
+            plain.as_ref().map(|c| (c.strict, c.best_effort)),
+            Some((false, false))
         );
+        let both = Config::from_yaml_str("serviceName: s\nstrict: true\nbestEffort: true\n").ok();
+        assert_eq!(both.map(|c| (c.strict, c.best_effort)), Some((true, true)));
+    }
+
+    #[test]
+    fn a_set_environment_overrides_the_yaml_switch_and_the_flag_overrides_both() {
+        assert!(!resolve_switch_with(false, None, false));
+        assert!(resolve_switch_with(false, None, true));
+        assert!(resolve_switch_with(false, Some("1"), false));
+        assert!(resolve_switch_with(false, Some(" TRUE "), false));
+        // A set environment variable decides either way, as in sanshain-js.
+        assert!(!resolve_switch_with(false, Some("false"), true));
+        assert!(!resolve_switch_with(false, Some("yes"), true));
+        // An empty variable counts as unset.
+        assert!(resolve_switch_with(false, Some(""), true));
+        assert!(resolve_switch_with(true, Some("false"), false));
     }
 
     #[test]
@@ -1693,7 +1746,7 @@ requires:
 "#,
         )
         .expect("config should parse");
-        assert_eq!(config.service_name, "order-service");
+        assert_eq!(config.service_name.as_deref(), Some("order-service"));
         assert_eq!(
             config.sanshain_url.as_deref(),
             Some("https://sanshain.example.com")

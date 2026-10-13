@@ -53,14 +53,42 @@ so shared schemas are emitted once and generated types stay shared.
 | `--tag=<branch>` | `SANSHAIN_TAG` | This build belongs to a sanshain-branch (release or hotfix).  |
 | —          | `SANSHAIN_URL`     | Server base URL; overrides `sanshainUrl` from `sanshain.yaml`.  |
 | —          | `SANSHAIN_TOKEN`   | API token, sent as `Authorization: Bearer` on every request.    |
+| —          | `SANSHAIN_STRICT`  | Fail on missing configuration instead of warning (`strict`).    |
+| `--best-effort` | `SANSHAIN_BEST_EFFORT` | Failed calls become warnings; exit 0 (`bestEffort`). |
 
-A switch variable (`SANSHAIN_GA`, `SANSHAIN_TRUNK`) is on for `true` or `1`, in any case and
+A switch variable (`SANSHAIN_GA`, `SANSHAIN_TRUNK`, `SANSHAIN_STRICT`, `SANSHAIN_BEST_EFFORT`) is on for `true` or `1`, in any case and
 with surrounding whitespace ignored; any other value leaves it off.
 
 Stability and stream are declared by the pipeline, never committed to `sanshain.yaml` — the
 same checkout is built by trunk CI and on a developer's laptop, and only the pipeline knows
 which of them speaks for trunk. Declaring both `--trunk` and `--tag` fails before any
 request is sent.
+
+## Strict mode and best effort
+
+By default a command warns and skips when its configuration is missing — no `serviceName`, no
+`provide`/`provides` entries for `provide`, no `requires` entries for `require` — and exits 0.
+That makes it safe to run both commands in every build, even where only one applies. To fail
+instead, enable strict mode in `sanshain.yaml` or the environment:
+
+```yaml
+strict: true          # or SANSHAIN_STRICT=true
+```
+
+Best effort goes the other way: a failed call (server error, unreachable server, missing spec
+file) is printed as a warning followed by `Continuing (best effort)`, and the build exits 0.
+`require` carries on with the next entry; `provide` skips a missing spec file and stops at the
+first failed call. A `sanshain.yaml` that cannot be loaded is softened only by `--best-effort`
+or `SANSHAIN_BEST_EFFORT`, since the file itself cannot say so.
+
+```yaml
+bestEffort: true      # or SANSHAIN_BEST_EFFORT=true, or --best-effort
+```
+
+Best effort never softens strict: missing configuration under strict still fails.
+
+A set environment variable overrides the `sanshain.yaml` value either way
+(`SANSHAIN_STRICT=false` turns off `strict: true`); `--best-effort` always turns best effort on.
 
 ## In CI
 
