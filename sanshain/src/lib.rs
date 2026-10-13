@@ -75,6 +75,15 @@ impl std::fmt::Display for Stability {
     }
 }
 
+/// Whether a `SANSHAIN_*` boolean switch is on: `true` or `1`, trimmed and
+/// case-insensitive. Anything else — including unset — is off.
+pub fn is_switch_on(value: Option<&str>) -> bool {
+    value.is_some_and(|v| {
+        let v = v.trim();
+        v.eq_ignore_ascii_case("true") || v == "1"
+    })
+}
+
 /// Resolves the stability of a provide: the explicit `--ga` flag or
 /// `SANSHAIN_GA=true` switch to GA; everything else is a snapshot.
 pub fn resolve_stability(ga_flag: bool) -> Stability {
@@ -83,8 +92,7 @@ pub fn resolve_stability(ga_flag: bool) -> Stability {
 
 /// [`resolve_stability`] with the environment value passed in (testable).
 pub fn resolve_stability_with(ga_flag: bool, ga_env: Option<&str>) -> Stability {
-    let env_ga = ga_env.is_some_and(|v| v.eq_ignore_ascii_case("true") || v == "1");
-    if ga_flag || env_ga {
+    if ga_flag || is_switch_on(ga_env) {
         Stability::Ga
     } else {
         Stability::Snapshot
@@ -139,8 +147,7 @@ impl Stream {
         trunk_env: Option<&str>,
         tag_env: Option<&str>,
     ) -> Result<Stream> {
-        let is_true = |v: &str| v.eq_ignore_ascii_case("true") || v == "1";
-        let trunk = trunk_flag || trunk_env.is_some_and(is_true);
+        let trunk = trunk_flag || is_switch_on(trunk_env);
         let tag = tag
             .or(tag_env)
             .map(str::trim)
@@ -1239,6 +1246,37 @@ mod tests {
         assert_eq!(resolve_stability_with(true, None), Stability::Ga);
         // The explicit flag wins even when the environment says otherwise.
         assert_eq!(resolve_stability_with(true, Some("false")), Stability::Ga);
+    }
+
+    #[test]
+    fn switches_are_true_or_1_trimmed_and_case_insensitive() {
+        for on in ["1", "true", "TRUE", " true ", "True\n"] {
+            assert!(is_switch_on(Some(on)), "{on:?} should switch on");
+        }
+        for off in ["yes", "on", "0", "false", "", " ", "truely"] {
+            assert!(!is_switch_on(Some(off)), "{off:?} should stay off");
+        }
+        assert!(!is_switch_on(None));
+    }
+
+    #[test]
+    fn ga_and_trunk_read_their_switch_the_same_way() {
+        for (value, on) in [
+            ("1", true),
+            ("TRUE", true),
+            (" true ", true),
+            ("yes", false),
+        ] {
+            let expected = if on {
+                Stability::Ga
+            } else {
+                Stability::Snapshot
+            };
+            assert_eq!(resolve_stability_with(false, Some(value)), expected);
+            let stream = Stream::resolve_with(false, None, Some(value), None).ok();
+            let expected = if on { Stream::Trunk } else { Stream::None };
+            assert_eq!(stream, Some(expected), "SANSHAIN_TRUNK={value:?}");
+        }
     }
 
     #[test]

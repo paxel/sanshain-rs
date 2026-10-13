@@ -54,6 +54,9 @@ so shared schemas are emitted once and generated types stay shared.
 | —          | `SANSHAIN_URL`     | Server base URL; overrides `sanshainUrl` from `sanshain.yaml`.  |
 | —          | `SANSHAIN_TOKEN`   | API token, sent as `Authorization: Bearer` on every request.    |
 
+A switch variable (`SANSHAIN_GA`, `SANSHAIN_TRUNK`) is on for `true` or `1`, in any case and
+with surrounding whitespace ignored; any other value leaves it off.
+
 Stability and stream are declared by the pipeline, never committed to `sanshain.yaml` — the
 same checkout is built by trunk CI and on a developer's laptop, and only the pipeline knows
 which of them speaks for trunk. Declaring both `--trunk` and `--tag` fails before any
