@@ -3,7 +3,8 @@
 //! (409, 404, 410, pre-2.0 server) are surfaced.
 
 use sanshain::{
-    ApiType, Client, Config, Endpoint, Error, ProvideEntry, RequireEntry, Stability, Stream,
+    ApiType, Client, Config, Endpoint, Error, ProvideEntry, RequireEntry, RequireFormat, Stability,
+    Stream,
 };
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -142,6 +143,7 @@ fn require_entry(name: &str, endpoints: Vec<Endpoint>) -> RequireEntry {
         version: "1.2.0".to_string(),
         output_directory: test_dir(name).join("out"),
         endpoints,
+        format: None,
     }
 }
 
@@ -684,4 +686,102 @@ fn a_relative_catalog_info_resolves_next_to_the_config() {
             .as_str()
             .is_some_and(|yaml| yaml.contains("kind: Component"))
     );
+}
+
+// --- format: openapi ---
+
+fn asyncapi_as_openapi(name: &str, endpoints: usize) -> RequireEntry {
+    let mut entry = require_entry(
+        name,
+        (0..endpoints)
+            .map(|i| Endpoint {
+                method: "SUB".to_string(),
+                path: format!("user/event{i}"),
+            })
+            .collect(),
+    );
+    entry.api_type = ApiType::AsyncApi;
+    entry.format = Some(RequireFormat::OpenApi);
+    entry
+}
+
+#[test]
+fn format_openapi_is_sent_on_the_single_and_the_bundle_call() {
+    for (name, endpoints, expected) in [
+        ("format_single", 1, "GET /require/asyncapi?"),
+        ("format_bundle", 2, "POST /require-bundle?"),
+    ] {
+        let (url, handle) = mock_server(vec![http_response(
+            "200 OK",
+            "application/yaml",
+            "openapi: 3.0.3\ninfo:\n  title: events\n",
+        )]);
+        let client = Client::new(url.as_str(), None);
+        let entry = asyncapi_as_openapi(name, endpoints);
+        let written = match client.require("gateway-service", &entry) {
+            Ok(written) => written,
+            Err(err) => panic!("{name}: require failed: {err}"),
+        };
+        // Same file name as without a format.
+        assert_eq!(written, entry.output_directory.join("user-service.yaml"));
+        let requests = joined_requests(handle);
+        let line = request_line(&requests[0]);
+        assert!(line.starts_with(expected), "{name}: {line}");
+        assert!(line.contains("format=openapi"), "{name}: {line}");
+    }
+}
+
+#[test]
+fn without_a_format_no_format_parameter_is_sent() {
+    for (name, endpoints) in [("no_format_single", 1), ("no_format_bundle", 2)] {
+        let (url, handle) = mock_server(vec![http_response(
+            "200 OK",
+            "application/yaml",
+            "asyncapi: 2.6.0\n",
+        )]);
+        let client = Client::new(url.as_str(), None);
+        let mut entry = asyncapi_as_openapi(name, endpoints);
+        entry.format = None;
+        if let Err(err) = client.require("gateway-service", &entry) {
+            panic!("{name}: require failed: {err}");
+        }
+        let requests = joined_requests(handle);
+        assert!(!requests[0].contains("format"), "{name}: {}", requests[0]);
+    }
+}
+
+#[test]
+fn an_asyncapi_answer_to_format_openapi_needs_2_4_and_writes_nothing() {
+    let entry = asyncapi_as_openapi("format_old_server", 1);
+    let (url, handle) = mock_server(vec![
+        http_response("200 OK", "application/yaml", "asyncapi: 2.6.0\n"),
+        version_response("2.3.0"),
+    ]);
+    let client = Client::new(url.as_str(), None);
+    let message = match client.require("gateway-service", &entry) {
+        Err(err) => err.to_string(),
+        Ok(_) => panic!("expected the require to fail"),
+    };
+    assert_eq!(
+        message,
+        "format: openapi needs Sanshain Service 2.4.0 or later (server is 2.3.0)"
+    );
+    assert!(!entry.output_directory.join("user-service.yaml").exists());
+    let requests = joined_requests(handle);
+    assert!(request_line(&requests[1]).starts_with("GET /version "));
+
+    let (url, handle) = mock_server(vec![
+        http_response("200 OK", "application/yaml", "asyncapi: 2.6.0\n"),
+        http_response("404 Not Found", "text/plain", ""),
+    ]);
+    let client = Client::new(url.as_str(), None);
+    let message = match client.require("gateway-service", &entry) {
+        Err(err) => err.to_string(),
+        Ok(_) => panic!("expected the require to fail"),
+    };
+    assert_eq!(
+        message,
+        "format: openapi needs Sanshain Service 2.4.0 or later (server version unknown)"
+    );
+    drop(joined_requests(handle));
 }

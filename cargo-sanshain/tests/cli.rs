@@ -664,3 +664,53 @@ fn a_legacy_field_errors_before_any_cat() {
     );
     assert!(!err.contains("O_o"), "unexpected stderr: {err}");
 }
+
+// --- format: openapi ---
+
+fn format_yaml(url: &str, api_type: &str) -> String {
+    format!(
+        "serviceName: demo-service\nsanshainUrl: {url}\nrequires:\n  - serviceName: events\n    apiType: {api_type}\n    format: openapi\n    version: 1.0.0\n    outputDirectory: out\n    endpoints:\n      - method: SUB\n        path: user/signup\n"
+    )
+}
+
+#[test]
+fn format_with_the_wrong_api_type_fails_before_any_call() {
+    let dir = project("format_wrong_api_type");
+    // Nothing listens here: reaching the network would be a different error.
+    write(
+        &dir.join("sanshain.yaml"),
+        &format_yaml("http://127.0.0.1:9", "openapi"),
+    );
+    let output = run(&dir, &["require"], &[]);
+    assert_failure(&output);
+    let err = stderr(&output);
+    assert!(
+        err.contains("requires[0] (events): 'format: openapi' is not valid with apiType 'openapi'"),
+        "unexpected stderr: {err}"
+    );
+    assert!(!err.contains("O_o"), "format is a known field: {err}");
+}
+
+#[test]
+fn best_effort_warns_on_a_non_openapi_answer_and_writes_nothing() {
+    let dir = project("format_best_effort");
+    let (url, handle) = mock_server(vec![
+        http_response("200 OK", "asyncapi: 2.6.0\n"),
+        version_response("2.3.0"),
+    ]);
+    write(&dir.join("sanshain.yaml"), &format_yaml(&url, "asyncapi"));
+    let output = run(&dir, &["require", "--best-effort"], &[]);
+    assert_success(&output);
+    let err = stderr(&output);
+    assert!(
+        err.contains("format: openapi needs Sanshain Service 2.4.0 or later (server is 2.3.0)"),
+        "unexpected stderr: {err}"
+    );
+    assert!(
+        err.contains("Continuing (best effort)"),
+        "unexpected stderr: {err}"
+    );
+    assert!(!dir.join("out/events.yaml").exists());
+    let requests = joined_requests(handle);
+    assert!(requests[0].contains("format=openapi"), "{}", requests[0]);
+}

@@ -337,6 +337,27 @@ pub struct RequireEntry {
     pub version: String,
     pub output_directory: PathBuf,
     pub endpoints: Vec<Endpoint>,
+    /// The format to receive the snippet in, when it differs from the API
+    /// type's own. Only [`RequireFormat::OpenApi`] for an AsyncAPI entry.
+    #[serde(default)]
+    pub format: Option<RequireFormat>,
+}
+
+/// A format a requires entry can ask the server to convert its snippet to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RequireFormat {
+    /// An AsyncAPI snippet as an OpenAPI document (its message schemas), for
+    /// OpenAPI code generators. Needs Sanshain Service 2.4.0 or later.
+    OpenApi,
+}
+
+impl RequireFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RequireFormat::OpenApi => "openapi",
+        }
+    }
 }
 
 /// Configuration from `[package.metadata.sanshain]` in `Cargo.toml`.
@@ -455,6 +476,7 @@ const KNOWN_REQUIRE_FIELDS: &[&str] = &[
     "version",
     "outputDirectory",
     "endpoints",
+    "format",
 ];
 const KNOWN_ENDPOINT_FIELDS: &[&str] = &["method", "path"];
 
@@ -626,6 +648,29 @@ fn require_context(i: usize, entry_obj: &serde_json::Map<String, Value>) -> Stri
     format!("requires[{i}] ({name})")
 }
 
+/// `format` exists for one combination only: `format: openapi` on an
+/// `apiType: asyncapi` entry.
+fn check_format(context: &str, format: &Value, api_type: Option<&Value>) -> Result<()> {
+    const ALLOWED: &str = "the only combination is 'format: openapi' with 'apiType: asyncapi'";
+    if format.as_str() != Some("openapi") {
+        let shown = format
+            .as_str()
+            .map_or_else(|| format.to_string(), str::to_string);
+        return Err(Error::Config(format!(
+            "{context}: format '{shown}' is not supported — {ALLOWED}"
+        )));
+    }
+    if api_type.and_then(Value::as_str) != Some("asyncapi") {
+        let shown = api_type
+            .and_then(Value::as_str)
+            .unwrap_or(ApiType::default().as_str());
+        return Err(Error::Config(format!(
+            "{context}: 'format: openapi' is not valid with apiType '{shown}' — {ALLOWED}"
+        )));
+    }
+    Ok(())
+}
+
 /// Everything after the legacy rejections and the unknown-field detection:
 /// pins, endpoints, and the shape of each field.
 fn validate(value: &Value, unknown_fields: Vec<String>) -> Result<Config> {
@@ -662,6 +707,9 @@ fn validate(value: &Value, unknown_fields: Vec<String>) -> Result<Config> {
                         "{context}: 'endpoints' must list at least one endpoint (method + path)"
                     )));
                 }
+            }
+            if let Some(format) = entry_obj.get("format") {
+                check_format(&context, format, entry_obj.get("apiType"))?;
             }
         }
     }
@@ -926,7 +974,39 @@ pub(crate) fn require_query<'a>(
         ("method", endpoint.method.as_str()),
     ];
     params.extend(stream.query_params());
+    params.extend(format_query(entry));
     params
+}
+
+/// The `format` query parameter, sent on both require calls — empty when the
+/// entry asks for none, so nothing changes for it.
+fn format_query(entry: &RequireEntry) -> Vec<(&'static str, &'static str)> {
+    entry
+        .format
+        .map(|format| ("format", format.as_str()))
+        .into_iter()
+        .collect()
+}
+
+/// Whether a require answer is an OpenAPI document (a top-level `openapi`
+/// key). A service predating `format` ignores the parameter and answers in
+/// the entry's own format instead.
+fn is_openapi_document(body: &str) -> bool {
+    serde_yaml_ng::from_str::<serde_yaml_ng::Value>(body)
+        .ok()
+        .and_then(|doc| doc.as_mapping().map(|m| m.contains_key("openapi")))
+        .unwrap_or(false)
+}
+
+/// The failure for a `format: openapi` answer that is not OpenAPI.
+pub(crate) fn format_unsupported_message(server_version: Option<&str>) -> String {
+    match server_version {
+        Some(version) => {
+            format!("format: openapi needs Sanshain Service 2.4.0 or later (server is {version})")
+        }
+        None => "format: openapi needs Sanshain Service 2.4.0 or later (server version unknown)"
+            .to_string(),
+    }
 }
 
 /// Builds the JSON payload for a `POST /require-bundle` call. Unlike the
@@ -1234,12 +1314,23 @@ impl Client {
             request.call()
         } else {
             let url = format!("{}/require-bundle", self.base_url);
-            self.with_auth(ureq::post(&url))
-                .send_json(require_bundle_payload(consumername, entry, &self.stream))
+            let mut request = self.with_auth(ureq::post(&url));
+            for (key, value) in format_query(entry) {
+                request = request.query(key, value);
+            }
+            request.send_json(require_bundle_payload(consumername, entry, &self.stream))
         };
         match result {
             Ok(response) => {
                 let body = response.into_string()?;
+                // Checked before anything is written: an older service that
+                // ignored `format` must not leave AsyncAPI where the build
+                // expects OpenAPI.
+                if entry.format == Some(RequireFormat::OpenApi) && !is_openapi_document(&body) {
+                    return Err(Error::Api(format_unsupported_message(
+                        self.server_version().as_deref(),
+                    )));
+                }
                 fs::create_dir_all(&entry.output_directory)?;
                 let out = entry.output_directory.join(format!(
                     "{}.{}",
@@ -1353,6 +1444,7 @@ mod tests {
                 method: "GET".to_string(),
                 path: "/api/v1/users/{id}".to_string(),
             }],
+            format: None,
         }
     }
 
@@ -1776,6 +1868,86 @@ requires:
     fn strict_in_the_file_is_readable_when_validation_fails() {
         let loaded = Config::load_yaml_str("strict: true\nrequires:\n  - serviceName: u\n");
         assert!(loaded.as_ref().is_ok_and(|l| l.strict && l.config.is_err()));
+    }
+
+    fn asyncapi_entry_yaml(extra: &str) -> String {
+        format!(
+            "serviceName: s\nrequires:\n  - serviceName: events\n    version: 1.0.0\n    outputDirectory: out\n{extra}    endpoints:\n      - method: SUB\n        path: user/signup\n"
+        )
+    }
+
+    #[test]
+    fn format_openapi_on_an_asyncapi_entry_is_known_and_parsed() {
+        let loaded = Config::load_yaml_str(&asyncapi_entry_yaml(
+            "    apiType: asyncapi\n    format: openapi\n",
+        ));
+        let Ok(loaded) = loaded else {
+            panic!("the config should load");
+        };
+        assert!(
+            loaded.unknown_fields.is_empty(),
+            "no cat: {:?}",
+            loaded.unknown_fields
+        );
+        let format = loaded.config.ok().and_then(|c| c.requires[0].format);
+        assert_eq!(format, Some(RequireFormat::OpenApi));
+        let plain = Config::from_yaml_str(&asyncapi_entry_yaml("    apiType: asyncapi\n")).ok();
+        assert_eq!(plain.and_then(|c| c.requires[0].format), None);
+    }
+
+    #[test]
+    fn format_with_another_api_type_is_a_configuration_error() {
+        for extra in [
+            "    format: openapi\n",
+            "    apiType: proto\n    format: openapi\n",
+        ] {
+            match Config::from_yaml_str(&asyncapi_entry_yaml(extra)) {
+                Err(Error::Config(message)) => {
+                    assert!(message.starts_with("requires[0] (events): "), "{message}");
+                    assert!(
+                        message.contains("'format: openapi' with 'apiType: asyncapi'"),
+                        "{message}"
+                    );
+                }
+                other => panic!("expected a configuration error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn an_unknown_format_value_is_a_configuration_error() {
+        match Config::from_yaml_str(&asyncapi_entry_yaml(
+            "    apiType: asyncapi\n    format: json-schema\n",
+        )) {
+            Err(Error::Config(message)) => {
+                assert!(
+                    message
+                        .starts_with("requires[0] (events): format 'json-schema' is not supported"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected a configuration error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_format_rides_the_query_only_when_set() {
+        let mut entry = require_entry();
+        let plain = require_query("c", &entry, &entry.endpoints[0], &Stream::None);
+        assert!(plain.iter().all(|(k, _)| *k != "format"), "got: {plain:?}");
+        entry.api_type = ApiType::AsyncApi;
+        entry.format = Some(RequireFormat::OpenApi);
+        let query = require_query("c", &entry, &entry.endpoints[0], &Stream::None);
+        assert!(query.contains(&("format", "openapi")), "got: {query:?}");
+    }
+
+    #[test]
+    fn only_a_document_with_a_top_level_openapi_key_is_openapi() {
+        assert!(is_openapi_document("openapi: 3.0.3\ninfo: {}\n"));
+        assert!(is_openapi_document(r#"{"openapi":"3.1.0"}"#));
+        assert!(!is_openapi_document("asyncapi: 2.6.0\nchannels: {}\n"));
+        assert!(!is_openapi_document("info:\n  openapi: 3.0.3\n"));
+        assert!(!is_openapi_document("not: [yaml"));
     }
 
     #[test]

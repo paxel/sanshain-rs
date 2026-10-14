@@ -12,6 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `catalog` requires Sanshain Service 2.4.0; all other commands work with any 2.x service.
 - Strict mode (`strict: true` in `sanshain.yaml` or `SANSHAIN_STRICT=true`): missing configuration fails the command instead of warning and skipping.
 - Best effort (`bestEffort: true`, `SANSHAIN_BEST_EFFORT=true` or `--best-effort`): a failed call is printed as a warning and the command exits 0.
+- `format: openapi` on an `apiType: asyncapi` requires entry downloads the pinned channels as an OpenAPI document under the same file name; needs Sanshain Service 2.4.0.
 - A field in `sanshain.yaml` that no Sanshain client knows (a typo such as `catalogInf`) is reported once per run with the puzzled cat and ignored; under strict mode it fails the command.
 
 ### Changed

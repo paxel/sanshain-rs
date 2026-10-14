@@ -113,6 +113,38 @@ untouched.
 Retiring needs the `releaser` role — which a release pipeline already holds — or a
 maintainer grant on that Producer.
 
+## AsyncAPI as OpenAPI (`format`)
+
+A `requires` entry with `apiType: asyncapi` may add `format: openapi`: Sanshain then answers
+the pinned channels as an OpenAPI document of their message schemas, for OpenAPI code
+generators. It is written under the same file name as without `format`. `openapi` is the only
+value and AsyncAPI the only API type it combines with; anything else fails before any request.
+To get both formats, list the entry twice with different `outputDirectory`s:
+
+```yaml
+requires:
+  - serviceName: user-events
+    apiType: asyncapi
+    version: 1.4.0
+    outputDirectory: generated/user-events/asyncapi
+    endpoints:
+      - method: SUB
+        path: user/signup
+  - serviceName: user-events
+    apiType: asyncapi
+    format: openapi
+    version: 1.4.0
+    outputDirectory: generated/user-events/openapi
+    endpoints:
+      - method: SUB
+        path: user/signup
+```
+
+`format` needs **Sanshain Service 2.4.0 or later**. An older service ignores it and answers
+AsyncAPI; the client notices, writes nothing, and fails with
+`format: openapi needs Sanshain Service 2.4.0 or later (server is <version>)` (a warning
+under best effort).
+
 ## Catalog
 
 `catalogInfo` names the project's Backstage `catalog-info.yaml`. [`Client::catalog`] pushes it
