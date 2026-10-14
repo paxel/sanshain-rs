@@ -998,6 +998,31 @@ fn is_openapi_document(body: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether a failed `format: openapi` require is a pre-2.4.0 service refusing
+/// the parameter: its single route answers `400` naming `format` (unknown
+/// query field). A 2.4.0+ service's own `400` passes through unchanged.
+fn rejected_format_on_old_server(
+    entry: &RequireEntry,
+    status: u16,
+    body: &str,
+    server_version: Option<&str>,
+) -> bool {
+    entry.format == Some(RequireFormat::OpenApi)
+        && status == 400
+        && body.to_ascii_lowercase().contains("format")
+        && server_version
+            .and_then(major_minor)
+            .is_none_or(|v| v < (2, 4))
+}
+
+/// `MAJOR.MINOR` of a reported version, `None` when it does not parse.
+fn major_minor(version: &str) -> Option<(u64, u64)> {
+    let mut parts = version.trim().trim_start_matches('v').split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().map_or(Some(0), |m| m.parse().ok())?;
+    Some((major, minor))
+}
+
 /// The failure for a `format: openapi` answer that is not OpenAPI.
 pub(crate) fn format_unsupported_message(server_version: Option<&str>) -> String {
     match server_version {
@@ -1340,8 +1365,12 @@ impl Client {
                 fs::write(&out, body)?;
                 Ok(out)
             }
-            Err(err) => Err(self.map_failure(err, |status, body, _| {
-                require_error_message(status, body, entry, &self.base_url)
+            Err(err) => Err(self.map_failure(err, |status, body, server_version| {
+                if rejected_format_on_old_server(entry, status, body, server_version) {
+                    format_unsupported_message(server_version)
+                } else {
+                    require_error_message(status, body, entry, &self.base_url)
+                }
             })),
         }
     }
@@ -1939,6 +1968,58 @@ requires:
         entry.format = Some(RequireFormat::OpenApi);
         let query = require_query("c", &entry, &entry.endpoints[0], &Stream::None);
         assert!(query.contains(&("format", "openapi")), "got: {query:?}");
+    }
+
+    #[test]
+    fn only_a_pre_2_4_service_rejecting_format_counts_as_too_old() {
+        let mut entry = require_entry();
+        entry.api_type = ApiType::AsyncApi;
+        entry.format = Some(RequireFormat::OpenApi);
+        let body = r#"{"error":"unknown field `format`"}"#;
+        assert!(rejected_format_on_old_server(
+            &entry,
+            400,
+            body,
+            Some("2.3.9")
+        ));
+        assert!(rejected_format_on_old_server(&entry, 400, body, None));
+        assert!(rejected_format_on_old_server(
+            &entry,
+            400,
+            "Unknown FORMAT",
+            Some("v2")
+        ));
+        assert!(!rejected_format_on_old_server(
+            &entry,
+            400,
+            body,
+            Some("2.4.0")
+        ));
+        assert!(!rejected_format_on_old_server(
+            &entry,
+            400,
+            body,
+            Some("3.0.0")
+        ));
+        assert!(!rejected_format_on_old_server(
+            &entry,
+            400,
+            "bad payload",
+            Some("2.3.0")
+        ));
+        assert!(!rejected_format_on_old_server(
+            &entry,
+            404,
+            body,
+            Some("2.3.0")
+        ));
+        entry.format = None;
+        assert!(!rejected_format_on_old_server(
+            &entry,
+            400,
+            body,
+            Some("2.3.0")
+        ));
     }
 
     #[test]

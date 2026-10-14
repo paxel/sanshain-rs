@@ -785,3 +785,72 @@ fn an_asyncapi_answer_to_format_openapi_needs_2_4_and_writes_nothing() {
     );
     drop(joined_requests(handle));
 }
+
+fn unknown_format_400() -> String {
+    http_response(
+        "400 Bad Request",
+        "application/json",
+        r#"{"error":"Failed to deserialize query string: unknown field `format`"}"#,
+    )
+}
+
+#[test]
+fn a_pre_2_4_service_rejecting_format_on_the_single_route_needs_2_4() {
+    let entry = asyncapi_as_openapi("format_400_old", 1);
+    let (url, handle) = mock_server(vec![unknown_format_400(), version_response("2.3.0")]);
+    let client = Client::new(url.as_str(), None);
+    let message = match client.require("gateway-service", &entry) {
+        Err(err) => err.to_string(),
+        Ok(_) => panic!("expected the require to fail"),
+    };
+    assert_eq!(
+        message,
+        "format: openapi needs Sanshain Service 2.4.0 or later (server is 2.3.0)"
+    );
+    assert!(!entry.output_directory.join("user-service.yaml").exists());
+    drop(joined_requests(handle));
+
+    let (url, handle) = mock_server(vec![
+        unknown_format_400(),
+        http_response("404 Not Found", "text/plain", ""),
+    ]);
+    let client = Client::new(url.as_str(), None);
+    let message = match client.require("gateway-service", &entry) {
+        Err(err) => err.to_string(),
+        Ok(_) => panic!("expected the require to fail"),
+    };
+    assert_eq!(
+        message,
+        "format: openapi needs Sanshain Service 2.4.0 or later (server version unknown)"
+    );
+    drop(joined_requests(handle));
+}
+
+#[test]
+fn a_2_4_service_s_own_format_400_passes_through() {
+    let entry = asyncapi_as_openapi("format_400_new", 1);
+    let (url, handle) = mock_server(vec![
+        http_response(
+            "400 Bad Request",
+            "application/json",
+            r#"{"error":"cannot convert to format openapi: message 'UserSignedUp' uses an Avro payload"}"#,
+        ),
+        version_response("2.4.0"),
+    ]);
+    let client = Client::new(url.as_str(), None);
+    let message = match client.require("gateway-service", &entry) {
+        Err(err) => err.to_string(),
+        Ok(_) => panic!("expected the require to fail"),
+    };
+    assert!(
+        message.contains(
+            "cannot convert to format openapi: message 'UserSignedUp' uses an Avro payload"
+        ),
+        "unexpected: {message}"
+    );
+    assert!(
+        !message.contains("needs Sanshain Service 2.4.0"),
+        "unexpected: {message}"
+    );
+    drop(joined_requests(handle));
+}

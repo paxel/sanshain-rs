@@ -714,3 +714,25 @@ fn best_effort_warns_on_a_non_openapi_answer_and_writes_nothing() {
     let requests = joined_requests(handle);
     assert!(requests[0].contains("format=openapi"), "{}", requests[0]);
 }
+
+#[test]
+fn best_effort_warns_when_an_old_service_rejects_format() {
+    let dir = project("format_400_best_effort");
+    let (url, handle) = mock_server(vec![
+        http_response(
+            "400 Bad Request",
+            r#"{"error":"Failed to deserialize query string: unknown field `format`"}"#,
+        ),
+        version_response("2.3.0"),
+    ]);
+    write(&dir.join("sanshain.yaml"), &format_yaml(&url, "asyncapi"));
+    let output = run(&dir, &["require"], &[("SANSHAIN_BEST_EFFORT", "true")]);
+    assert_success(&output);
+    let err = stderr(&output);
+    assert!(
+        err.contains("format: openapi needs Sanshain Service 2.4.0 or later (server is 2.3.0)"),
+        "unexpected stderr: {err}"
+    );
+    assert!(!dir.join("out/events.yaml").exists());
+    drop(joined_requests(handle));
+}

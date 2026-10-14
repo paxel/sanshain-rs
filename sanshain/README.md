@@ -145,6 +145,9 @@ AsyncAPI; the client notices, writes nothing, and fails with
 `format: openapi needs Sanshain Service 2.4.0 or later (server is <version>)` (a warning
 under best effort).
 
+An older service rejects the single-endpoint request or returns AsyncAPI; the client reports
+that it needs 2.4.0.
+
 ## Catalog
 
 `catalogInfo` names the project's Backstage `catalog-info.yaml`. [`Client::catalog`] pushes it
