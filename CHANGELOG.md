@@ -20,6 +20,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - A missing `serviceName`, or no `provide`/`provides` or `requires` entries for the command at hand, now warns and exits 0 instead of failing; strict mode restores the failure.
 - `SANSHAIN_GA` and `SANSHAIN_TRUNK` ignore surrounding whitespace, so ` true ` switches them on like `true`, `TRUE` or `1`.
 
+### Security
+- Updated `rustls` to 0.23.46 (RUSTSEC-2026-0285, RUSTSEC-2026-0346, RUSTSEC-2026-0348) and `anyhow` to 1.0.104 (RUSTSEC-2026-0190).
+
 ### Breaking Changes
 - Library: `Config::service_name` is now an `Option<String>`, and `Config` has new public fields (`strict`, `best_effort`, `catalog_info`, `unknown_fields`), so code that reads or builds a `Config` must be adapted.
 
