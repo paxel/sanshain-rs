@@ -581,7 +581,7 @@ fn catalog_url_encodes_the_service_name() {
 }
 
 #[test]
-fn catalog_400_names_the_file_and_the_metadata_name_rule() {
+fn a_catalog_400_from_an_old_pre_release_service_is_a_plain_failure() {
     let file = catalog_file("catalog_400");
     let (url, handle) = mock_server(vec![
         http_response(
@@ -598,10 +598,7 @@ fn catalog_400_names_the_file_and_the_metadata_name_rule() {
     };
     assert_eq!(
         message,
-        format!(
-            "Sanshain rejected {}: no Component named 'orders-service'. The Component's metadata.name must equal serviceName 'orders-service'.",
-            file.display()
-        )
+        "catalog failed (400): no Component named 'orders-service'"
     );
     drop(joined_requests(handle));
 }
@@ -852,5 +849,145 @@ fn a_2_4_service_s_own_format_400_passes_through() {
         !message.contains("needs Sanshain Service 2.4.0"),
         "unexpected: {message}"
     );
+    drop(joined_requests(handle));
+}
+
+// --- Sanshain-Warning ---
+
+/// `response` with one `Sanshain-Warning` header line per warning.
+fn with_warnings(response: String, warnings: &[&str]) -> String {
+    let headers: String = warnings
+        .iter()
+        .map(|w| format!("Sanshain-Warning: {w}\r\n"))
+        .collect();
+    response.replacen("\r\n", &format!("\r\n{headers}"), 1)
+}
+
+const NO_BRANCH: &str =
+    "no sanshain-branch 'Release-X' - this build was not recorded in a release graph";
+
+#[test]
+fn every_call_hands_over_its_warnings_once_in_order() {
+    let snippet = http_response("200 OK", "application/yaml", "openapi: 3.0.3\n");
+    let retired = http_response(
+        "200 OK",
+        "application/json",
+        r#"{"trunk_pins_closed":0,"contracts_released":0}"#,
+    );
+    let (url, handle) = mock_server(vec![
+        with_warnings(accepted_response(), &[NO_BRANCH]),
+        with_warnings(retired, &["retired, a, b"]),
+        with_warnings(snippet.clone(), &[NO_BRANCH, "second, with a comma"]),
+        with_warnings(snippet, &["bundle"]),
+        snippet_without_warning(),
+    ]);
+    let client = Client::new(url.as_str(), None).with_stream(Stream::Tag("Release-X".to_string()));
+    assert!(client.take_warnings().is_empty());
+
+    let entry = spec_entry("warn_provide", ApiType::OpenApi);
+    if let Err(err) = client.provide("svc", &entry, Stability::Snapshot) {
+        panic!("provide failed: {err}");
+    }
+    assert_eq!(client.take_warnings(), vec![NO_BRANCH]);
+    assert!(client.take_warnings().is_empty(), "taken means gone");
+
+    if let Err(err) = client.retire("svc", ApiType::OpenApi) {
+        panic!("retire failed: {err}");
+    }
+    assert_eq!(client.take_warnings(), vec!["retired, a, b"]);
+
+    let one = require_entry(
+        "warn_require",
+        vec![Endpoint {
+            method: "GET".to_string(),
+            path: "/x".to_string(),
+        }],
+    );
+    if let Err(err) = client.require("svc", &one) {
+        panic!("require failed: {err}");
+    }
+    assert_eq!(
+        client.take_warnings(),
+        vec![NO_BRANCH, "second, with a comma"]
+    );
+
+    let two = require_entry(
+        "warn_bundle",
+        vec![
+            Endpoint {
+                method: "GET".to_string(),
+                path: "/x".to_string(),
+            },
+            Endpoint {
+                method: "GET".to_string(),
+                path: "/y".to_string(),
+            },
+        ],
+    );
+    if let Err(err) = client.require("svc", &two) {
+        panic!("bundle failed: {err}");
+    }
+    assert_eq!(client.take_warnings(), vec!["bundle"]);
+
+    if let Err(err) = client.require("svc", &one) {
+        panic!("require failed: {err}");
+    }
+    assert!(client.take_warnings().is_empty());
+    drop(joined_requests(handle));
+}
+
+fn snippet_without_warning() -> String {
+    http_response("200 OK", "application/yaml", "openapi: 3.0.3\n")
+}
+
+#[test]
+fn an_unread_catalog_is_recorded_false_with_the_reason_as_a_warning() {
+    let file = catalog_file("catalog_unread");
+    let reason = "no Component named 'orders-service' in catalog-info.yaml";
+    let (url, handle) = mock_server(vec![
+        with_warnings(
+            http_response(
+                "200 OK",
+                "application/json",
+                r#"{"system":"orders-service","trunk":false,"resources":[],"recorded":false}"#,
+            ),
+            &[reason],
+        ),
+        catalog_ok_response(false),
+    ]);
+    let client = Client::new(url.as_str(), None);
+    let unread = match client.catalog("orders-service", &file) {
+        Ok(response) => response,
+        Err(err) => panic!("an unread catalog is no failure: {err}"),
+    };
+    assert!(!unread.recorded);
+    assert!(unread.resources.is_empty());
+    assert_eq!(client.take_warnings(), vec![reason]);
+
+    // A service answering without the field recorded what it answered.
+    match client.catalog("orders-service", &file) {
+        Ok(response) => assert!(response.recorded),
+        Err(err) => panic!("catalog failed: {err}"),
+    }
+    drop(joined_requests(handle));
+}
+
+#[test]
+fn a_warning_on_a_failure_is_kept_too() {
+    let entry = spec_entry("warn_failure", ApiType::OpenApi);
+    let (url, handle) = mock_server(vec![
+        with_warnings(
+            http_response(
+                "409 Conflict",
+                "application/json",
+                r#"{"error":"GA 1.4.0 already exists"}"#,
+            ),
+            &[NO_BRANCH],
+        ),
+        version_response("2.4.0"),
+    ]);
+    let client = Client::new(url.as_str(), None);
+    assert!(client.provide("svc", &entry, Stability::Ga).is_err());
+    assert_eq!(client.take_warnings(), vec![NO_BRANCH]);
     drop(joined_requests(handle));
 }

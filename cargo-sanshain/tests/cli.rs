@@ -510,7 +510,7 @@ fn catalog_strict_does_not_ask_for_provides_or_requires() {
 }
 
 #[test]
-fn catalog_400_fails_and_best_effort_turns_it_into_a_warning() {
+fn a_catalog_400_fails_and_best_effort_turns_it_into_a_warning() {
     let rejected = || {
         mock_server(vec![
             http_response(
@@ -525,10 +525,7 @@ fn catalog_400_fails_and_best_effort_turns_it_into_a_warning() {
     let output = run(&dir, &["catalog"], &[]);
     assert_failure(&output);
     assert!(
-        stderr(&output).contains(&format!(
-            "Sanshain rejected {}: no Component named 'orders-service'. The Component's metadata.name must equal serviceName 'orders-service'.",
-            dir.join("catalog-info.yaml").display()
-        )),
+        stderr(&output).contains("catalog failed (400): no Component named 'orders-service'"),
         "unexpected stderr: {}",
         stderr(&output)
     );
@@ -544,7 +541,7 @@ fn catalog_400_fails_and_best_effort_turns_it_into_a_warning() {
     assert_success(&output);
     let err = stderr(&output);
     assert!(
-        err.contains("Sanshain rejected"),
+        err.contains("catalog failed (400)"),
         "unexpected stderr: {err}"
     );
     assert!(
@@ -734,5 +731,185 @@ fn best_effort_warns_when_an_old_service_rejects_format() {
         "unexpected stderr: {err}"
     );
     assert!(!dir.join("out/events.yaml").exists());
+    drop(joined_requests(handle));
+}
+
+// --- Sanshain-Warning: the graph never fails a build ---
+
+const NO_BRANCH: &str =
+    "no sanshain-branch 'Release-X' - this build was not recorded in a release graph";
+const NEITHER: &str = "trunk and tag are mutually exclusive - this build is recorded in neither";
+
+/// `response` with one `Sanshain-Warning` header line per warning.
+fn with_warnings(response: String, warnings: &[&str]) -> String {
+    let headers: String = warnings
+        .iter()
+        .map(|w| format!("Sanshain-Warning: {w}\r\n"))
+        .collect();
+    response.replacen("\r\n", &format!("\r\n{headers}"), 1)
+}
+
+fn stored_response() -> String {
+    http_response(
+        "202 Accepted",
+        r#"{"version":"1.4.0","stability":"snapshot","content_hash":"sha256:abc","changes":{"inserts":1,"updates":0,"deletes":0}}"#,
+    )
+}
+
+/// A project providing `specs/openapi.yaml` to `url`.
+fn provide_project(name: &str, url: &str) -> PathBuf {
+    let dir = project(name);
+    write_spec(&dir);
+    write(
+        &dir.join("sanshain.yaml"),
+        &format!(
+            "serviceName: demo-service\nsanshainUrl: {url}\nprovides:\n  - file: specs/openapi.yaml\n"
+        ),
+    );
+    dir
+}
+
+#[test]
+fn each_warning_is_printed_once_and_the_build_passes() {
+    let (url, handle) = mock_server(vec![with_warnings(stored_response(), &[NO_BRANCH])]);
+    let dir = provide_project("warn_single", &url);
+    let output = run(&dir, &["provide", "--tag", "Release-X"], &[]);
+    assert_success(&output);
+    assert_eq!(stderr(&output), format!("warning: {NO_BRANCH}\n"));
+    assert!(stdout(&output).contains("Stored version 1.4.0"));
+    drop(joined_requests(handle));
+
+    let second = "something else, with a comma";
+    let (url, handle) = mock_server(vec![with_warnings(stored_response(), &[NO_BRANCH, second])]);
+    let dir = provide_project("warn_multiple", &url);
+    let output = run(&dir, &["provide"], &[]);
+    assert_success(&output);
+    assert_eq!(
+        stderr(&output),
+        format!("warning: {NO_BRANCH}\nwarning: {second}\n")
+    );
+    drop(joined_requests(handle));
+}
+
+#[test]
+fn strict_fails_after_a_warned_call_even_with_best_effort() {
+    for (name, args) in [
+        ("warn_strict", &["provide"][..]),
+        ("warn_strict_best_effort", &["provide", "--best-effort"][..]),
+    ] {
+        let (url, handle) = mock_server(vec![with_warnings(stored_response(), &[NO_BRANCH])]);
+        let dir = provide_project(name, &url);
+        let output = run(&dir, args, &[("SANSHAIN_STRICT", "true")]);
+        assert_failure(&output);
+        let err = stderr(&output);
+        assert!(
+            err.contains(&format!("warning: {NO_BRANCH}")),
+            "{name}: {err}"
+        );
+        assert!(
+            err.contains(&format!("strict: Sanshain warned: {NO_BRANCH}")),
+            "{name}: {err}"
+        );
+        assert!(!err.contains("Continuing (best effort)"), "{name}: {err}");
+        // The call was made: strict fails after it, not instead of it.
+        assert_eq!(joined_requests(handle).len(), 1, "{name}");
+    }
+}
+
+#[test]
+fn strict_require_fails_on_a_warning_even_with_best_effort() {
+    let dir = project("warn_require_strict");
+    let (url, handle) = mock_server(vec![with_warnings(
+        http_response("200 OK", "openapi: 3.0.3\n"),
+        &[NO_BRANCH],
+    )]);
+    write(
+        &dir.join("sanshain.yaml"),
+        &format!(
+            "serviceName: demo-service\nsanshainUrl: {url}\nstrict: true\nbestEffort: true\nrequires:\n  - serviceName: user-service\n    version: 1.2.0\n    outputDirectory: out\n    endpoints:\n      - method: GET\n        path: /y\n"
+        ),
+    );
+    let output = run(&dir, &["require", "--tag", "Release-X"], &[]);
+    assert_failure(&output);
+    let err = stderr(&output);
+    assert!(
+        err.contains(&format!("strict: Sanshain warned: {NO_BRANCH}")),
+        "{err}"
+    );
+    assert!(!err.contains("Continuing (best effort)"), "{err}");
+    drop(joined_requests(handle));
+}
+
+#[test]
+fn local_trunk_and_tag_warn_and_send_neither() {
+    let (url, handle) = mock_server(vec![stored_response()]);
+    let dir = provide_project("trunk_and_tag", &url);
+    let output = run(
+        &dir,
+        &["provide", "--tag", "Release-X"],
+        &[("SANSHAIN_TRUNK", "true")],
+    );
+    assert_success(&output);
+    assert_eq!(stderr(&output), format!("warning: {NEITHER}\n"));
+    let requests = joined_requests(handle);
+    let body = requests[0].split("\r\n\r\n").nth(1).unwrap_or("");
+    assert!(!body.contains("trunk"), "{body}");
+    assert!(!body.contains("\"tag\""), "{body}");
+}
+
+#[test]
+fn local_trunk_and_tag_fail_under_strict_before_any_request() {
+    // Nothing listens on port 9: a request would fail differently.
+    let dir = provide_project("trunk_and_tag_strict", "http://127.0.0.1:9");
+    let output = run(
+        &dir,
+        &["provide", "--trunk", "--tag", "Release-X", "--best-effort"],
+        &[("SANSHAIN_STRICT", "1")],
+    );
+    assert_failure(&output);
+    let err = stderr(&output);
+    assert!(err.contains(&format!("warning: {NEITHER}")), "{err}");
+    assert!(err.contains(&format!("strict: {NEITHER}")), "{err}");
+    assert!(!err.contains("Continuing (best effort)"), "{err}");
+}
+
+fn unrecorded_catalog_response(reason: &str) -> String {
+    with_warnings(
+        http_response(
+            "200 OK",
+            r#"{"system":"orders-service","trunk":false,"resources":[],"recorded":false}"#,
+        ),
+        &[reason],
+    )
+}
+
+#[test]
+fn an_unrecorded_catalog_warns_and_passes_unless_strict() {
+    let reason = "no Component named 'orders-service' in catalog-info.yaml";
+    let (url, handle) = mock_server(vec![unrecorded_catalog_response(reason)]);
+    let dir = catalog_project(
+        "catalog_unrecorded",
+        &url,
+        "catalogInfo: catalog-info.yaml\n",
+    );
+    let output = run(&dir, &["catalog"], &[]);
+    assert_success(&output);
+    assert_eq!(stderr(&output), format!("warning: {reason}\n"));
+    assert_eq!(stdout(&output), "");
+    drop(joined_requests(handle));
+
+    let (url, handle) = mock_server(vec![unrecorded_catalog_response(reason)]);
+    let dir = catalog_project(
+        "catalog_unrecorded_strict",
+        &url,
+        "strict: true\ncatalogInfo: catalog-info.yaml\n",
+    );
+    let output = run(&dir, &["catalog", "--best-effort"], &[]);
+    assert_failure(&output);
+    assert!(
+        stderr(&output).contains(&format!("strict: Sanshain warned: {reason}")),
+        "{}",
+        stderr(&output)
+    );
     drop(joined_requests(handle));
 }

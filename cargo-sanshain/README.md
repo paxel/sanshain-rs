@@ -73,8 +73,10 @@ Catalog recorded for orders-service (main+dev): 1 resources
 
 A trunk build (`--trunk` / `SANSHAIN_TRUNK`) updates the main graph and the dev graph; any
 other build only the dev graph. Without `catalogInfo` it warns and skips (fails under strict;
-strict checks only `serviceName` and `catalogInfo` here). A `400` means Sanshain could not read
-the file as this project's Component — usually its `metadata.name` is not the `serviceName`.
+strict checks only `serviceName` and `catalogInfo` here). A file Sanshain cannot read as this
+project's Component — usually its `metadata.name` is not the `serviceName` — records nothing
+and keeps the previous periphery: `catalog` prints Sanshain's reason as a warning and exits 0
+(fails under strict).
 **`catalog` needs Sanshain Service 2.4.0 or later**; an older service answers `404`, reported as
 such. Every other command works with any 2.x service.
 
@@ -130,8 +132,10 @@ with surrounding whitespace ignored; any other value leaves it off.
 
 Stability and stream are declared by the pipeline, never committed to `sanshain.yaml` — the
 same checkout is built by trunk CI and on a developer's laptop, and only the pipeline knows
-which of them speaks for trunk. Declaring both `--trunk` and `--tag` fails before any
-request is sent.
+which of them speaks for trunk. Declaring both `--trunk` and `--tag` records the build in
+neither graph: it prints
+`warning: trunk and tag are mutually exclusive - this build is recorded in neither` and sends
+neither (fails before any request under strict).
 
 ## Strict mode and best effort
 
@@ -155,6 +159,14 @@ bestEffort: true      # or SANSHAIN_BEST_EFFORT=true, or --best-effort
 ```
 
 Best effort never softens strict: missing configuration under strict still fails.
+
+## Warnings
+
+The dependency graph is informational and never fails a build. Where Sanshain does not record
+a call in a graph — an unknown `--tag`, a `catalog-info.yaml` it cannot read — the call
+succeeds and Sanshain sends a `Sanshain-Warning` header. Each one is printed as
+`warning: <text>` and the build carries on. Under strict mode a warning fails the command after
+the call, with `strict: Sanshain warned: <text>` — best effort does not soften that.
 
 A set environment variable overrides the `sanshain.yaml` value either way
 (`SANSHAIN_STRICT=false` turns off `strict: true`); `--best-effort` always turns best effort on.

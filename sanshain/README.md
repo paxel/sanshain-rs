@@ -94,13 +94,28 @@ sanshain-branch, or neither — via [`Stream`], set once on the [`Client`]:
 ```rust,no_run
 # use sanshain::{Client, Stream};
 # let client = Client::new("http://localhost:3000", None);
-let client = client.with_stream(Stream::resolve(false, Some("Release-Maribou"))?);
-# Ok::<(), sanshain::Error>(())
+let (stream, warning) = Stream::resolve(false, Some("Release-Maribou"));
+if let Some(warning) = warning {
+    eprintln!("warning: {warning}");
+}
+let client = client.with_stream(stream);
 ```
 
 The stream is a property of the invocation, not of the repository, so it comes from flags
 or `SANSHAIN_TRUNK` / `SANSHAIN_TAG` and never from `sanshain.yaml`. Trunk and a tag are
-mutually exclusive, and [`Stream`] cannot represent both.
+mutually exclusive, and [`Stream`] cannot represent both: declaring both resolves to
+[`Stream::None`] together with the warning
+`trunk and tag are mutually exclusive - this build is recorded in neither`.
+
+## Warnings
+
+The dependency graph is informational and never fails a build. Where Sanshain does not
+record a call in a graph — an unknown sanshain-branch, a `catalog-info.yaml` it cannot read —
+the call still succeeds, and the response carries a `Sanshain-Warning` header, one line per
+warning. [`Client::take_warnings`] hands over every warning received since its last call (from
+any call, success or failure); printing them, and failing under strict mode, is up to the
+caller. `cargo sanshain` prints each as `warning: <text>` and, under strict mode, fails with
+`strict: Sanshain warned: <text>`.
 
 ## Retiring
 
@@ -156,7 +171,10 @@ with `PUT /catalog/<serviceName>`, so the network graph shows the peripheral res
 `metadata.name` equals `serviceName`, and of it only `spec.dependsOn`; each push replaces the
 previous set. A trunk stream sends `trunk: true` and updates the main graph as well as the
 dev graph; any other stream updates only the dev graph. The returned [`CatalogResponse`]
-lists the recorded resources.
+lists the recorded resources. A file Sanshain cannot read as this project's Component (invalid
+YAML, no Component named `serviceName`, a malformed `dependsOn`) records nothing — the previous
+periphery stays — and answers with [`CatalogResponse::recorded`] `false` and a warning naming
+the reason.
 
 This needs **Sanshain Service 2.4.0 or later**; every other call works with any 2.x service.
 
@@ -180,8 +198,6 @@ Harvested subscriptions come back on the provide response as
 - **409** — the version rules refused the provide; the message carries `proposed_version`.
   The fix is always a version bump in your own spec file; the client never edits it.
 - **410** — the pinned version exists but deliberately lacks the requested endpoints.
-- **400 on a catalog push** — Sanshain could not read the file as this project's Component;
-  usually its `metadata.name` is not the `serviceName`.
 - **404 on a catalog push** — the service is older than 2.4.0; the message names its version.
 - **Pre-2.0 server** — after a failure the client makes one lazy `GET /version` and reports
   an old instance as such.

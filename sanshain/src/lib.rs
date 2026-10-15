@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 use serde_yaml_ng::Value as YamlValue;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 use thiserror::Error;
 
 /// Environment variable that switches provides to GA stability (`true` or `1`).
@@ -39,6 +40,15 @@ pub const BEST_EFFORT_ENV_VAR: &str = "SANSHAIN_BEST_EFFORT";
 
 /// The default configuration file name, in the project root.
 pub const CONFIG_FILE: &str = "sanshain.yaml";
+
+/// The response header through which Sanshain reports something worth a build
+/// warning — an unknown sanshain-branch, an unreadable catalog. It may appear
+/// several times, one warning per header line. See [`Client::take_warnings`].
+pub const WARNING_HEADER: &str = "Sanshain-Warning";
+
+/// What [`Stream::resolve`] reports for a build declaring both trunk and a tag.
+pub const TRUNK_AND_TAG_WARNING: &str =
+    "trunk and tag are mutually exclusive - this build is recorded in neither";
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -130,8 +140,8 @@ pub fn resolve_stability_with(ga_flag: bool, ga_env: Option<&str>) -> Stability 
 /// is last-writer-wins — inferring the stream would let a local build overwrite
 /// what CI recorded.
 ///
-/// Trunk and a tag are mutually exclusive (the server answers `400` for a call
-/// carrying both), so this type cannot hold both.
+/// Trunk and a tag are mutually exclusive, so this type cannot hold both; a
+/// build declaring both resolves to [`Stream::None`] with a warning.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Stream {
     /// The build speaks for no graph — the default.
@@ -149,7 +159,7 @@ impl Stream {
     ///
     /// Reads [`TRUNK_ENV_VAR`] and [`TAG_ENV_VAR`]; see [`Stream::resolve_with`]
     /// for the testable form.
-    pub fn resolve(trunk_flag: bool, tag: Option<&str>) -> Result<Stream> {
+    pub fn resolve(trunk_flag: bool, tag: Option<&str>) -> (Stream, Option<&'static str>) {
         Stream::resolve_with(
             trunk_flag,
             tag,
@@ -160,14 +170,16 @@ impl Stream {
 
     /// [`Stream::resolve`] with the environment values passed in.
     ///
-    /// A build declaring both trunk and a tag is a misconfiguration worth
-    /// naming here rather than spending a round trip to hear `400`.
+    /// A build declaring both trunk and a tag is recorded in neither graph:
+    /// the graph is informational and never fails a build, so this resolves
+    /// to [`Stream::None`] together with [`TRUNK_AND_TAG_WARNING`] — for the
+    /// caller to print, and to fail on under strict mode.
     pub fn resolve_with(
         trunk_flag: bool,
         tag: Option<&str>,
         trunk_env: Option<&str>,
         tag_env: Option<&str>,
-    ) -> Result<Stream> {
+    ) -> (Stream, Option<&'static str>) {
         let trunk = trunk_flag || is_switch_on(trunk_env);
         let tag = tag
             .or(tag_env)
@@ -176,14 +188,10 @@ impl Stream {
             .map(str::to_string);
 
         match (trunk, tag) {
-            (true, Some(tag)) => Err(Error::Config(format!(
-                "this build declares both trunk and tag '{tag}' — a build belongs to the trunk \
-                 stream or to one sanshain-branch, never both; set only one of --trunk / \
-                 {TRUNK_ENV_VAR} and --tag / {TAG_ENV_VAR}"
-            ))),
-            (true, None) => Ok(Stream::Trunk),
-            (false, Some(tag)) => Ok(Stream::Tag(tag)),
-            (false, None) => Ok(Stream::None),
+            (true, Some(_)) => (Stream::None, Some(TRUNK_AND_TAG_WARNING)),
+            (true, None) => (Stream::Trunk, None),
+            (false, Some(tag)) => (Stream::Tag(tag), None),
+            (false, None) => (Stream::None, None),
         }
     }
 
@@ -1154,6 +1162,16 @@ pub struct CatalogResponse {
     pub trunk: bool,
     /// The recorded refs, `resource:<namespace>/<name>`, lower-cased and sorted.
     pub resources: Vec<String>,
+    /// Whether anything was recorded. `false` when Sanshain could not read
+    /// the file as this project's Component — the previous periphery stays,
+    /// and a [`WARNING_HEADER`] names the reason.
+    #[serde(default = "recorded_by_default")]
+    pub recorded: bool,
+}
+
+/// A service predating the `recorded` field only answered `200` on success.
+fn recorded_by_default() -> bool {
+    true
 }
 
 /// Builds the JSON payload for a catalog push. `trunk` appears only for a
@@ -1168,23 +1186,17 @@ pub(crate) fn catalog_payload(content: &str, stream: &Stream) -> Value {
     payload
 }
 
-/// Formats a failed catalog push. A `400` is almost always a Component whose
-/// `metadata.name` is not the `serviceName`; a `404` means the service
-/// predates the catalog endpoint.
+/// Formats a failed catalog push. A `404` means the service predates the
+/// catalog endpoint; a file Sanshain cannot read is no failure but a `200`
+/// with `recorded: false` and a warning.
 pub(crate) fn catalog_error_message(
     status: u16,
     body: &str,
-    catalog_info: &Path,
-    service_name: &str,
     server_version: Option<&str>,
 ) -> String {
     let parsed: Option<ErrorBody> = serde_json::from_str(body).ok();
     let server_message = parsed.map_or_else(|| fallback_message(body), |b| b.error);
     match status {
-        400 => format!(
-            "Sanshain rejected {}: {server_message}. The Component's metadata.name must equal serviceName '{service_name}'.",
-            catalog_info.display()
-        ),
         404 => match server_version {
             Some(version) => format!(
                 "sanshain catalog needs Sanshain Service 2.4.0 or later (server is {version})"
@@ -1228,6 +1240,8 @@ pub struct Client {
     base_url: String,
     token: Option<String>,
     stream: Stream,
+    /// Every [`WARNING_HEADER`] value received and not yet taken.
+    warnings: Mutex<Vec<String>>,
 }
 
 impl Client {
@@ -1240,6 +1254,7 @@ impl Client {
             base_url,
             token,
             stream: Stream::None,
+            warnings: Mutex::new(Vec::new()),
         }
     }
 
@@ -1268,6 +1283,28 @@ impl Client {
         Ok(Self::new(url, std::env::var(TOKEN_ENV_VAR).ok()))
     }
 
+    /// Every [`WARNING_HEADER`] line the server sent since the last call of
+    /// this, in order, success or failure alike. A warning never fails a
+    /// call by itself; printing it, and failing under strict mode, is the
+    /// caller's job.
+    pub fn take_warnings(&self) -> Vec<String> {
+        std::mem::take(&mut *self.lock_warnings())
+    }
+
+    fn lock_warnings(&self) -> std::sync::MutexGuard<'_, Vec<String>> {
+        // A panic elsewhere cannot leave a Vec<String> half-written.
+        self.warnings.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Keeps the response's warnings — read before the body consumes it.
+    fn record_warnings(&self, response: &ureq::Response) {
+        let found = response.all(WARNING_HEADER);
+        if !found.is_empty() {
+            self.lock_warnings()
+                .extend(found.into_iter().map(str::to_string));
+        }
+    }
+
     fn with_auth(&self, request: ureq::Request) -> ureq::Request {
         match &self.token {
             Some(token) => request.set("Authorization", &format!("Bearer {token}")),
@@ -1293,7 +1330,10 @@ impl Client {
         );
         let url = format!("{}{}", self.base_url, entry.api_type.provide_path());
         match self.with_auth(ureq::post(&url)).send_json(payload) {
-            Ok(response) => Ok(response.into_json()?),
+            Ok(response) => {
+                self.record_warnings(&response);
+                Ok(response.into_json()?)
+            }
             Err(err) => Err(self.map_failure(err, |status, body, _| {
                 provide_error_message(status, body, entry.api_type, &entry.file)
             })),
@@ -1317,7 +1357,10 @@ impl Client {
             .with_auth(ureq::post(&url))
             .send_json(retire_payload(producername))
         {
-            Ok(response) => Ok(response.into_json()?),
+            Ok(response) => {
+                self.record_warnings(&response);
+                Ok(response.into_json()?)
+            }
             Err(err) => Err(self.map_failure(err, |status, body, _| {
                 retire_error_message(status, body, producername)
             })),
@@ -1347,6 +1390,7 @@ impl Client {
         };
         match result {
             Ok(response) => {
+                self.record_warnings(&response);
                 let body = response.into_string()?;
                 // Checked before anything is written: an older service that
                 // ignored `format` must not leave AsyncAPI where the build
@@ -1382,7 +1426,10 @@ impl Client {
     /// Only a trunk stream is sent (`trunk: true` updates the main graph as
     /// well as the dev graph); a tag is never sent — the server refuses
     /// unknown fields. Needs Sanshain Service 2.4.0 or later: an older 2.x
-    /// service answers `404`, reported as such.
+    /// service answers `404`, reported as such. A file Sanshain cannot read
+    /// as this project's Component is no error: the answer has
+    /// [`CatalogResponse::recorded`] `false` and a warning (see
+    /// [`Client::take_warnings`]).
     pub fn catalog(&self, service_name: &str, catalog_info: &Path) -> Result<CatalogResponse> {
         let content = fs::read_to_string(catalog_info).map_err(|e| {
             Error::Config(format!(
@@ -1399,9 +1446,12 @@ impl Client {
             .with_auth(ureq::put(&url))
             .send_json(catalog_payload(&content, &self.stream))
         {
-            Ok(response) => Ok(response.into_json()?),
+            Ok(response) => {
+                self.record_warnings(&response);
+                Ok(response.into_json()?)
+            }
             Err(err) => Err(self.map_failure(err, |status, body, server_version| {
-                catalog_error_message(status, body, catalog_info, service_name, server_version)
+                catalog_error_message(status, body, server_version)
             })),
         }
     }
@@ -1414,6 +1464,9 @@ impl Client {
     where
         F: FnOnce(u16, &str, Option<&str>) -> String,
     {
+        if let ureq::Error::Status(_, response) = &err {
+            self.record_warnings(response);
+        }
         let server_version = self.server_version();
         if let Some(message) = server_version
             .as_deref()
@@ -1833,27 +1886,25 @@ requires:
 
     #[test]
     fn catalog_errors_name_the_fix() {
-        let file = Path::new("/p/catalog-info.yaml");
+        // A 400 is only an old pre-release service's answer: no special case.
         assert_eq!(
             catalog_error_message(
                 400,
                 r#"{"error":"no Component named 'svc'"}"#,
-                file,
-                "svc",
                 Some("2.4.0")
             ),
-            "Sanshain rejected /p/catalog-info.yaml: no Component named 'svc'. The Component's metadata.name must equal serviceName 'svc'."
+            "catalog failed (400): no Component named 'svc'"
         );
         assert_eq!(
-            catalog_error_message(404, "", file, "svc", Some("2.3.1")),
+            catalog_error_message(404, "", Some("2.3.1")),
             "sanshain catalog needs Sanshain Service 2.4.0 or later (server is 2.3.1)"
         );
         assert_eq!(
-            catalog_error_message(404, "", file, "svc", None),
+            catalog_error_message(404, "", None),
             "sanshain catalog needs Sanshain Service 2.4.0 or later (server version unknown)"
         );
         assert_eq!(
-            catalog_error_message(413, r#"{"error":"too large"}"#, file, "svc", None),
+            catalog_error_message(413, r#"{"error":"too large"}"#, None),
             "catalog failed (413): too large"
         );
     }
@@ -2093,7 +2144,7 @@ requires:
                 Stability::Snapshot
             };
             assert_eq!(resolve_stability_with(false, Some(value)), expected);
-            let stream = Stream::resolve_with(false, None, Some(value), None).ok();
+            let stream = Some(Stream::resolve_with(false, None, Some(value), None).0);
             let expected = if on { Stream::Trunk } else { Stream::None };
             assert_eq!(stream, Some(expected), "SANSHAIN_TRUNK={value:?}");
         }
@@ -2296,42 +2347,41 @@ requires:
     #[test]
     fn stream_defaults_to_none_and_prefers_the_flag_over_the_environment() {
         assert_eq!(
-            Stream::resolve_with(false, None, None, None).ok(),
-            Some(Stream::None)
+            Stream::resolve_with(false, None, None, None),
+            (Stream::None, None)
         );
         assert_eq!(
-            Stream::resolve_with(false, None, Some("true"), None).ok(),
-            Some(Stream::Trunk)
+            Stream::resolve_with(false, None, Some("true"), None),
+            (Stream::Trunk, None)
         );
         assert_eq!(
-            Stream::resolve_with(false, Some("from-flag"), None, Some("from-env")).ok(),
-            Some(Stream::Tag("from-flag".to_string()))
+            Stream::resolve_with(false, Some("from-flag"), None, Some("from-env")),
+            (Stream::Tag("from-flag".to_string()), None)
         );
         assert_eq!(
-            Stream::resolve_with(false, None, None, Some("R")).ok(),
-            Some(Stream::Tag("R".to_string()))
+            Stream::resolve_with(false, None, None, Some("R")),
+            (Stream::Tag("R".to_string()), None)
         );
         // A blank tag declares nothing rather than a branch named "".
         assert_eq!(
-            Stream::resolve_with(false, Some("   "), None, None).ok(),
-            Some(Stream::None)
+            Stream::resolve_with(false, Some("   "), None, None),
+            (Stream::None, None)
         );
     }
 
     #[test]
-    fn declaring_both_trunk_and_tag_is_refused_locally() {
-        match Stream::resolve_with(true, Some("R"), None, None) {
-            Err(Error::Config(message)) => {
-                assert!(message.contains("never both"), "unexpected: {message}");
-                assert!(
-                    message.contains('R'),
-                    "the message names the tag: {message}"
-                );
-            }
-            other => panic!("expected a configuration error, got {other:?}"),
-        }
+    fn declaring_both_trunk_and_tag_records_neither_with_a_warning() {
+        let neither = (
+            Stream::None,
+            Some("trunk and tag are mutually exclusive - this build is recorded in neither"),
+        );
+        assert_eq!(Stream::resolve_with(true, Some("R"), None, None), neither);
         // The collision is caught across sources too, not only within one.
-        assert!(Stream::resolve_with(true, None, None, Some("R")).is_err());
+        assert_eq!(Stream::resolve_with(true, None, None, Some("R")), neither);
+        assert_eq!(
+            Stream::resolve_with(false, Some("R"), Some("1"), None),
+            neither
+        );
     }
 
     #[test]

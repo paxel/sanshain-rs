@@ -68,14 +68,52 @@ struct StreamArgs {
 }
 
 impl StreamArgs {
-    fn resolve(&self) -> anyhow::Result<Stream> {
-        Ok(Stream::resolve(self.trunk, self.tag.as_deref())?)
+    /// Both trunk and a tag is no error: the build is recorded in neither,
+    /// with a warning — and under strict, a failure before any request.
+    fn resolve(&self, mode: &Mode) -> anyhow::Result<Stream> {
+        let (stream, warning) = Stream::resolve(self.trunk, self.tag.as_deref());
+        if let Some(warning) = warning {
+            eprintln!("warning: {warning}");
+            if mode.strict {
+                return Err(StrictFailure(format!("strict: {warning}")).into());
+            }
+        }
+        Ok(stream)
     }
+}
+
+/// A failure strict mode demands. Best effort never softens it.
+#[derive(Debug)]
+struct StrictFailure(String);
+
+impl std::fmt::Display for StrictFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for StrictFailure {}
+
+/// Prints each warning Sanshain sent with a call, then hands back the call's
+/// result — unless strict mode turns the first warning into a failure, which
+/// beats both the result and best effort.
+fn checked<T>(mode: &Mode, warnings: &[String], result: sanshain::Result<T>) -> anyhow::Result<T> {
+    for warning in warnings {
+        eprintln!("warning: {warning}");
+    }
+    if let (true, Some(first)) = (mode.strict, warnings.first()) {
+        if let Err(err) = &result {
+            eprintln!("{err}");
+        }
+        return Err(StrictFailure(format!("strict: Sanshain warned: {first}")).into());
+    }
+    Ok(result?)
 }
 
 /// How this run treats missing configuration and failed calls.
 struct Mode {
-    /// Missing configuration fails instead of warning and skipping.
+    /// Missing configuration, and any warning Sanshain sends, fails instead
+    /// of warning (and skipping).
     strict: bool,
     /// Failed calls become warnings and the run exits 0.
     best_effort: bool,
@@ -162,7 +200,7 @@ fn skip(mode: &Mode, missing: &str, command: &str) -> anyhow::Result<()> {
 /// Under best effort a failed call is reported and the run still succeeds.
 fn soften(mode: &Mode, result: anyhow::Result<()>) -> anyhow::Result<()> {
     match result {
-        Err(err) if mode.best_effort => {
+        Err(err) if mode.best_effort && !err.is::<StrictFailure>() => {
             eprintln!("{err:#}");
             eprintln!("Continuing (best effort)");
             Ok(())
@@ -200,13 +238,14 @@ fn provide_all(
     ga: bool,
     stream: &StreamArgs,
 ) -> anyhow::Result<bool> {
-    let client = Client::from_config(config)?.with_stream(stream.resolve()?);
+    let client = Client::from_config(config)?.with_stream(stream.resolve(mode)?);
     let stability = resolve_stability(ga);
     let mut provided = false;
     for entry in &config.provides {
         if entry.retired {
             println!("Retiring {} for '{service_name}'...", entry.api_type);
-            let shed = client.retire(service_name, entry.api_type)?;
+            let shed = client.retire(service_name, entry.api_type);
+            let shed = checked(mode, &client.take_warnings(), shed)?;
             match &shed.tag_cleared {
                 Some(tag) => println!(
                     "Retired: cleared the '{tag}' capability, closed {} trunk pin(s), released {} contract(s). History and existing pins are untouched.",
@@ -232,7 +271,8 @@ fn provide_all(
             "Providing {} as '{service_name}' ({stability})...",
             entry.file.display()
         );
-        let stored = client.provide(service_name, entry, stability)?;
+        let stored = client.provide(service_name, entry, stability);
+        let stored = checked(mode, &client.take_warnings(), stored)?;
         println!(
             "Stored version {} ({}): {} inserts, {} updates, {} deletes [{}]",
             stored.version,
@@ -268,7 +308,7 @@ fn require(config: &Config, mode: &Mode, stream: &StreamArgs) -> anyhow::Result<
     }
     let client = match Client::from_config(config)
         .map_err(anyhow::Error::from)
-        .and_then(|client| Ok(client.with_stream(stream.resolve()?)))
+        .and_then(|client| Ok(client.with_stream(stream.resolve(mode)?)))
     {
         Ok(client) => client,
         Err(err) => return soften(mode, Err(err)),
@@ -280,18 +320,19 @@ fn require(config: &Config, mode: &Mode, stream: &StreamArgs) -> anyhow::Result<
             entry.service_name,
             entry.version
         );
-        match client.require(service_name, entry) {
+        let written = client.require(service_name, entry);
+        match checked(mode, &client.take_warnings(), written) {
             Ok(written) => println!("Wrote {}", written.display()),
             // Each entry stands alone under best effort: one unreachable pin
             // does not keep the others from downloading.
-            Err(err) if mode.best_effort => {
+            Err(err) if mode.best_effort && !err.is::<StrictFailure>() => {
                 eprintln!(
                     "Error requiring {} {}: {err}",
                     entry.service_name, entry.version
                 );
                 eprintln!("Continuing (best effort)");
             }
-            Err(err) => return Err(err.into()),
+            Err(err) => return Err(err),
         }
     }
     Ok(())
@@ -307,8 +348,20 @@ fn catalog(config: &Config, mode: &Mode, stream: &StreamArgs) -> anyhow::Result<
         return skip(mode, "catalogInfo", "catalog");
     };
     let push = || -> anyhow::Result<()> {
-        let client = Client::from_config(config)?.with_stream(stream.resolve()?);
-        let recorded = client.catalog(service_name, catalog_info)?;
+        let client = Client::from_config(config)?.with_stream(stream.resolve(mode)?);
+        let recorded = client.catalog(service_name, catalog_info);
+        let mut warnings = client.take_warnings();
+        // The header names the reason; a service sending none still warns.
+        if recorded.as_ref().is_ok_and(|r| !r.recorded) && warnings.is_empty() {
+            warnings.push(format!(
+                "Sanshain did not record {}",
+                catalog_info.display()
+            ));
+        }
+        let recorded = checked(mode, &warnings, recorded)?;
+        if !recorded.recorded {
+            return Ok(());
+        }
         let graphs = if recorded.trunk { "main+dev" } else { "dev" };
         println!(
             "Catalog recorded for {} ({graphs}): {} resources",
