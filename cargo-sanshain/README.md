@@ -126,6 +126,10 @@ that it needs 2.4.0.
 | —          | `SANSHAIN_TOKEN`   | API token, sent as `Authorization: Bearer` on every request.    |
 | —          | `SANSHAIN_STRICT`  | Fail on missing configuration instead of warning (`strict`).    |
 | `--best-effort` | `SANSHAIN_BEST_EFFORT` | Failed calls become warnings; exit 0 (`bestEffort`). |
+| `--build-url=<url>` | `SANSHAIN_BUILD_URL` | Where this build ran; default: the runner's own variable. |
+| `--change-url=<url>` | `SANSHAIN_CHANGE_URL` | The pull or merge request behind it; default: the runner's own variable. |
+| `--tickets=<ids>` | `SANSHAIN_TICKETS` | Ticket ids this build closes, comma-separated. |
+| `--note=<text>` | `SANSHAIN_NOTE` | One line of intent for this provide. |
 
 A switch variable (`SANSHAIN_GA`, `SANSHAIN_TRUNK`, `SANSHAIN_STRICT`, `SANSHAIN_BEST_EFFORT`) is on for `true` or `1`, in any case and
 with surrounding whitespace ignored; any other value leaves it off.
@@ -136,6 +140,16 @@ which of them speaks for trunk. Declaring both `--trunk` and `--tag` records the
 neither graph: it prints
 `warning: trunk and tag are mutually exclusive - this build is recorded in neither` and sends
 neither (fails before any request under strict).
+
+### Origin: why this build provides
+
+`provide` sends what the pipeline knows about why it runs (Sanshain Service 2.9.0 and later);
+Sanshain stores it with the version and shows it on the version row, in the diff and the blame.
+The build and change URL default to the runner's own variables on GitHub Actions
+(`GITHUB_SERVER_URL`, `GITHUB_REPOSITORY`, `GITHUB_RUN_ID`, a pull request's `GITHUB_REF`), GitLab
+CI (`CI_JOB_URL`, `CI_MERGE_REQUEST_PROJECT_URL`, `CI_MERGE_REQUEST_IID`) and Jenkins (`BUILD_URL`,
+`CHANGE_URL`); tickets and the note come only from the pipeline. The latest provide that carries
+any of it wins; a byte-identical re-provide only fills an empty origin. Nothing is read from git.
 
 ## Strict mode and best effort
 

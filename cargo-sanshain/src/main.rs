@@ -1,8 +1,8 @@
 use anyhow::bail;
 use clap::{Parser, Subcommand};
 use sanshain::{
-    BEST_EFFORT_ENV_VAR, CONFIG_FILE, Client, Config, STRICT_ENV_VAR, Stream, puzzled_cat,
-    resolve_stability, resolve_switch_with,
+    BEST_EFFORT_ENV_VAR, CONFIG_FILE, Client, Config, Origin, OriginFlags, STRICT_ENV_VAR, Stream,
+    puzzled_cat, resolve_stability, resolve_switch_with,
 };
 
 #[derive(Parser)]
@@ -37,6 +37,8 @@ enum Commands {
         ga: bool,
         #[command(flatten)]
         stream: StreamArgs,
+        #[command(flatten)]
+        origin: OriginArgs,
     },
     /// Download the pinned endpoint snippet(s) declared in sanshain.yaml
     Require {
@@ -50,6 +52,36 @@ enum Commands {
         #[command(flatten)]
         stream: StreamArgs,
     },
+}
+
+/// Why this build provides — stored with the version as its origin. The build
+/// and change URL default to the runner's own variables (GitHub Actions,
+/// GitLab CI, Jenkins); tickets and the note come only from the pipeline.
+#[derive(clap::Args)]
+struct OriginArgs {
+    /// Where this build ran (same as SANSHAIN_BUILD_URL; default: the runner's own variable)
+    #[arg(long, value_name = "URL")]
+    build_url: Option<String>,
+    /// The pull or merge request behind this build (same as SANSHAIN_CHANGE_URL; default: the runner's own variable)
+    #[arg(long, value_name = "URL")]
+    change_url: Option<String>,
+    /// Ticket ids this build closes, comma-separated (same as SANSHAIN_TICKETS)
+    #[arg(long, value_name = "IDS")]
+    tickets: Option<String>,
+    /// One line of intent for this provide (same as SANSHAIN_NOTE)
+    #[arg(long, value_name = "TEXT")]
+    note: Option<String>,
+}
+
+impl OriginArgs {
+    fn resolve(&self) -> Origin {
+        Origin::resolve(&OriginFlags {
+            build_url: self.build_url.as_deref(),
+            change_url: self.change_url.as_deref(),
+            tickets: self.tickets.as_deref(),
+            note: self.note.as_deref(),
+        })
+    }
 }
 
 /// Which graph this build's calls belong to. Declared by the pipeline, never
@@ -176,7 +208,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     match args.command {
-        Commands::Provide { ga, stream } => provide(&config, &mode, ga, &stream),
+        Commands::Provide { ga, stream, origin } => provide(&config, &mode, ga, &stream, &origin),
         Commands::Require { stream } => require(&config, &mode, &stream),
         Commands::Catalog { stream } => catalog(&config, &mode, &stream),
     }
@@ -209,14 +241,20 @@ fn soften(mode: &Mode, result: anyhow::Result<()>) -> anyhow::Result<()> {
     }
 }
 
-fn provide(config: &Config, mode: &Mode, ga: bool, stream: &StreamArgs) -> anyhow::Result<()> {
+fn provide(
+    config: &Config,
+    mode: &Mode,
+    ga: bool,
+    stream: &StreamArgs,
+    origin: &OriginArgs,
+) -> anyhow::Result<()> {
     let Some(service_name) = config.service_name.as_deref() else {
         return skip(mode, "serviceName", "provide");
     };
     if config.provides.is_empty() {
         return skip(mode, "provide/provides entries", "provide");
     }
-    match provide_all(config, service_name, mode, ga, stream) {
+    match provide_all(config, service_name, mode, ga, stream, origin) {
         Ok(true) => Ok(()),
         // Only reachable when best effort skipped every missing spec file.
         Ok(false) if mode.strict => bail!("No specification files found to provide."),
@@ -237,8 +275,11 @@ fn provide_all(
     mode: &Mode,
     ga: bool,
     stream: &StreamArgs,
+    origin: &OriginArgs,
 ) -> anyhow::Result<bool> {
-    let client = Client::from_config(config)?.with_stream(stream.resolve(mode)?);
+    let client = Client::from_config(config)?
+        .with_stream(stream.resolve(mode)?)
+        .with_origin(origin.resolve());
     let stability = resolve_stability(ga);
     let mut provided = false;
     for entry in &config.provides {

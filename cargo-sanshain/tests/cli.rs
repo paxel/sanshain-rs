@@ -143,8 +143,21 @@ fn write_spec(dir: &Path) {
 fn run(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-sanshain"));
     command.arg("sanshain").args(args).current_dir(dir);
+    // The runner's own variables feed the origin of a provide: a test run
+    // inside GitHub Actions must not send its build URL either.
+    const RUNNER: [&str; 9] = [
+        "GITHUB_SERVER_URL",
+        "GITHUB_REPOSITORY",
+        "GITHUB_RUN_ID",
+        "GITHUB_REF",
+        "CI_JOB_URL",
+        "CI_MERGE_REQUEST_PROJECT_URL",
+        "CI_MERGE_REQUEST_IID",
+        "BUILD_URL",
+        "CHANGE_URL",
+    ];
     for (key, _) in std::env::vars() {
-        if key.starts_with("SANSHAIN_") {
+        if key.starts_with("SANSHAIN_") || RUNNER.contains(&key.as_str()) {
             command.env_remove(key);
         }
     }
@@ -855,6 +868,35 @@ fn local_trunk_and_tag_warn_and_send_neither() {
     let body = requests[0].split("\r\n\r\n").nth(1).unwrap_or("");
     assert!(!body.contains("trunk"), "{body}");
     assert!(!body.contains("\"tag\""), "{body}");
+}
+
+#[test]
+fn provide_sends_the_origin_of_the_build() {
+    let (url, handle) = mock_server(vec![stored_response()]);
+    let dir = provide_project("origin", &url);
+    let output = run(
+        &dir,
+        &[
+            "provide",
+            "--tickets",
+            "ORD-7,ORD-9",
+            "--note",
+            "Adds users",
+        ],
+        &[(
+            "SANSHAIN_CHANGE_URL",
+            "https://github.com/acme/orders/pull/7",
+        )],
+    );
+    assert_success(&output);
+    let requests = joined_requests(handle);
+    let body = requests[0].split("\r\n\r\n").nth(1).unwrap_or("");
+    assert!(body.contains(r#""tickets":["ORD-7","ORD-9"]"#), "{body}");
+    assert!(body.contains(r#""note":"Adds users""#), "{body}");
+    assert!(
+        body.contains(r#""change_url":"https://github.com/acme/orders/pull/7""#),
+        "{body}"
+    );
 }
 
 #[test]

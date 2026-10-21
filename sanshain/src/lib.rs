@@ -38,6 +38,15 @@ pub const STRICT_ENV_VAR: &str = "SANSHAIN_STRICT";
 /// overrides `bestEffort` in `sanshain.yaml` when set.
 pub const BEST_EFFORT_ENV_VAR: &str = "SANSHAIN_BEST_EFFORT";
 
+/// Environment variable naming where this build ran (part of its [`Origin`]).
+pub const BUILD_URL_ENV_VAR: &str = "SANSHAIN_BUILD_URL";
+/// Environment variable naming the pull or merge request behind this build.
+pub const CHANGE_URL_ENV_VAR: &str = "SANSHAIN_CHANGE_URL";
+/// Environment variable listing the ticket ids this build closes, comma-separated.
+pub const TICKETS_ENV_VAR: &str = "SANSHAIN_TICKETS";
+/// Environment variable carrying one line of intent for this provide.
+pub const NOTE_ENV_VAR: &str = "SANSHAIN_NOTE";
+
 /// The default configuration file name, in the project root.
 pub const CONFIG_FILE: &str = "sanshain.yaml";
 
@@ -128,6 +137,150 @@ pub fn resolve_stability_with(ga_flag: bool, ga_env: Option<&str>) -> Stability 
     } else {
         Stability::Snapshot
     }
+}
+
+/// What the pipeline knows about why a provide runs: where the build ran, the
+/// pull or merge request behind it, the tickets it closes and one line of
+/// intent. Sanshain stores it with the version (the latest provide that carries
+/// any of it wins; a byte-identical re-provide only fills an empty one).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Origin {
+    pub build_url: Option<String>,
+    pub change_url: Option<String>,
+    pub tickets: Vec<String>,
+    pub note: Option<String>,
+}
+
+/// The explicit values a pipeline passed for an [`Origin`] (CLI flags).
+#[derive(Debug, Clone, Default)]
+pub struct OriginFlags<'a> {
+    pub build_url: Option<&'a str>,
+    pub change_url: Option<&'a str>,
+    pub tickets: Option<&'a str>,
+    pub note: Option<&'a str>,
+}
+
+impl Origin {
+    /// The origin of this build from the flags and the process environment;
+    /// see [`Origin::resolve_with`].
+    pub fn resolve(flags: &OriginFlags<'_>) -> Origin {
+        Origin::resolve_with(flags, |name| std::env::var(name).ok())
+    }
+
+    /// An explicit flag first, then [`BUILD_URL_ENV_VAR`] / [`CHANGE_URL_ENV_VAR`] /
+    /// [`TICKETS_ENV_VAR`] / [`NOTE_ENV_VAR`], and for the build and change URL
+    /// the runner's own variables on GitHub Actions, GitLab CI and Jenkins.
+    /// Tickets and the note are human intent and never come from the runner.
+    /// Nothing is read from git.
+    pub fn resolve_with(flags: &OriginFlags<'_>, env: impl Fn(&str) -> Option<String>) -> Origin {
+        let build_url = first(&[
+            flags.build_url.map(str::to_string),
+            env(BUILD_URL_ENV_VAR),
+            runner_build_url(&env),
+        ]);
+        let change_url = first(&[
+            flags.change_url.map(str::to_string),
+            env(CHANGE_URL_ENV_VAR),
+            runner_change_url(&env),
+        ]);
+        let note = first(&[flags.note.map(str::to_string), env(NOTE_ENV_VAR)]);
+        let mut tickets: Vec<String> = Vec::new();
+        if let Some(list) = first(&[flags.tickets.map(str::to_string), env(TICKETS_ENV_VAR)]) {
+            for id in list.split(',').map(str::trim).filter(|id| !id.is_empty()) {
+                if !tickets.iter().any(|t| t == id) {
+                    tickets.push(id.to_string());
+                }
+            }
+        }
+        Origin {
+            build_url,
+            change_url,
+            tickets,
+            note,
+        }
+    }
+
+    /// Whether the origin says nothing.
+    pub fn is_empty(&self) -> bool {
+        self.build_url.is_none()
+            && self.change_url.is_none()
+            && self.tickets.is_empty()
+            && self.note.is_none()
+    }
+
+    /// Adds the known fields to a provide payload; unknown ones stay absent,
+    /// since the server refuses explicit nulls.
+    fn apply_to_payload(&self, map: &mut serde_json::Map<String, Value>) {
+        if let Some(url) = &self.build_url {
+            map.insert("build_url".to_string(), Value::String(url.clone()));
+        }
+        if let Some(url) = &self.change_url {
+            map.insert("change_url".to_string(), Value::String(url.clone()));
+        }
+        if !self.tickets.is_empty() {
+            map.insert(
+                "tickets".to_string(),
+                Value::Array(self.tickets.iter().cloned().map(Value::String).collect()),
+            );
+        }
+        if let Some(note) = &self.note {
+            map.insert("note".to_string(), Value::String(note.clone()));
+        }
+    }
+}
+
+/// The first value that is not blank, trimmed.
+fn first(values: &[Option<String>]) -> Option<String> {
+    values
+        .iter()
+        .flatten()
+        .map(|v| v.trim())
+        .find(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
+fn present(value: &Option<String>) -> Option<String> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
+/// Where this build ran, from the runner's own variables.
+fn runner_build_url(env: &impl Fn(&str) -> Option<String>) -> Option<String> {
+    if let (Some(server), Some(repo), Some(run)) = (
+        present(&env("GITHUB_SERVER_URL")),
+        present(&env("GITHUB_REPOSITORY")),
+        present(&env("GITHUB_RUN_ID")),
+    ) {
+        return Some(format!("{server}/{repo}/actions/runs/{run}"));
+    }
+    first(&[env("CI_JOB_URL"), env("BUILD_URL")])
+}
+
+/// The pull or merge request this build belongs to, from the runner's own variables.
+fn runner_change_url(env: &impl Fn(&str) -> Option<String>) -> Option<String> {
+    if let (Some(server), Some(repo), Some(git_ref)) = (
+        present(&env("GITHUB_SERVER_URL")),
+        present(&env("GITHUB_REPOSITORY")),
+        present(&env("GITHUB_REF")),
+    ) {
+        if let Some(number) = git_ref
+            .strip_prefix("refs/pull/")
+            .and_then(|rest| rest.split('/').next())
+            .filter(|n| !n.is_empty())
+        {
+            return Some(format!("{server}/{repo}/pull/{number}"));
+        }
+    }
+    if let (Some(project), Some(iid)) = (
+        present(&env("CI_MERGE_REQUEST_PROJECT_URL")),
+        present(&env("CI_MERGE_REQUEST_IID")),
+    ) {
+        return Some(format!("{project}/-/merge_requests/{iid}"));
+    }
+    first(&[env("CHANGE_URL")])
 }
 
 /// Which dependency graph a build's calls belong to: trunk, a named
@@ -1240,6 +1393,7 @@ pub struct Client {
     base_url: String,
     token: Option<String>,
     stream: Stream,
+    origin: Origin,
     /// Every [`WARNING_HEADER`] value received and not yet taken.
     warnings: Mutex<Vec<String>>,
 }
@@ -1254,6 +1408,7 @@ impl Client {
             base_url,
             token,
             stream: Stream::None,
+            origin: Origin::default(),
             warnings: Mutex::new(Vec::new()),
         }
     }
@@ -1265,6 +1420,12 @@ impl Client {
     /// provide and the next.
     pub fn with_stream(mut self, stream: Stream) -> Self {
         self.stream = stream;
+        self
+    }
+
+    /// Declares what this build says about why it provides (see [`Origin`]).
+    pub fn with_origin(mut self, origin: Origin) -> Self {
+        self.origin = origin;
         self
     }
 
@@ -1321,13 +1482,16 @@ impl Client {
         stability: Stability,
     ) -> Result<ProvideResponse> {
         let content = fs::read_to_string(&entry.file)?;
-        let payload = provide_payload(
+        let mut payload = provide_payload(
             producername,
             entry.api_type,
             &content,
             stability,
             &self.stream,
         );
+        if let Some(map) = payload.as_object_mut() {
+            self.origin.apply_to_payload(map);
+        }
         let url = format!("{}{}", self.base_url, entry.api_type.provide_path());
         match self.with_auth(ureq::post(&url)).send_json(payload) {
             Ok(response) => {
@@ -2169,6 +2333,110 @@ requires:
         for gone in ["branch", "base_version", "baseVersion", "force", "timeout"] {
             assert!(!keys.contains(&gone), "payload must not carry '{gone}'");
         }
+    }
+
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
+        let map: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |k| map.get(k).cloned()
+    }
+
+    #[test]
+    fn origin_flags_beat_the_environment_which_beats_the_runner() {
+        let env = env_of(&[
+            ("SANSHAIN_BUILD_URL", "https://ci/env"),
+            ("SANSHAIN_CHANGE_URL", "https://git/env"),
+            ("SANSHAIN_TICKETS", "ENV-1"),
+            ("SANSHAIN_NOTE", "env"),
+            ("BUILD_URL", "https://jenkins/7"),
+        ]);
+        let flags = OriginFlags {
+            build_url: Some(" https://ci/flag "),
+            change_url: Some("https://git/flag"),
+            tickets: Some("A-1, A-2 ,A-1,"),
+            note: Some(" flag "),
+        };
+        assert_eq!(
+            Origin::resolve_with(&flags, &env),
+            Origin {
+                build_url: Some("https://ci/flag".into()),
+                change_url: Some("https://git/flag".into()),
+                tickets: vec!["A-1".into(), "A-2".into()],
+                note: Some("flag".into()),
+            }
+        );
+        let from_env = Origin::resolve_with(&OriginFlags::default(), &env);
+        assert_eq!(from_env.build_url.as_deref(), Some("https://ci/env"));
+        assert_eq!(from_env.tickets, vec!["ENV-1".to_string()]);
+        assert!(Origin::resolve_with(&OriginFlags::default(), env_of(&[])).is_empty());
+    }
+
+    #[test]
+    fn origin_reads_github_gitlab_and_jenkins() {
+        let gh = Origin::resolve_with(
+            &OriginFlags::default(),
+            env_of(&[
+                ("GITHUB_SERVER_URL", "https://github.com"),
+                ("GITHUB_REPOSITORY", "acme/orders"),
+                ("GITHUB_RUN_ID", "123"),
+                ("GITHUB_REF", "refs/pull/42/merge"),
+            ]),
+        );
+        assert_eq!(
+            gh.build_url.as_deref(),
+            Some("https://github.com/acme/orders/actions/runs/123")
+        );
+        assert_eq!(
+            gh.change_url.as_deref(),
+            Some("https://github.com/acme/orders/pull/42")
+        );
+        let gl = Origin::resolve_with(
+            &OriginFlags::default(),
+            env_of(&[
+                ("CI_JOB_URL", "https://gitlab/acme/orders/-/jobs/7"),
+                ("CI_MERGE_REQUEST_PROJECT_URL", "https://gitlab/acme/orders"),
+                ("CI_MERGE_REQUEST_IID", "12"),
+            ]),
+        );
+        assert_eq!(
+            gl.change_url.as_deref(),
+            Some("https://gitlab/acme/orders/-/merge_requests/12")
+        );
+        let jk = Origin::resolve_with(
+            &OriginFlags::default(),
+            env_of(&[
+                ("BUILD_URL", "https://jenkins/job/7/"),
+                ("CHANGE_URL", "https://bitbucket/pr/5"),
+            ]),
+        );
+        assert_eq!(jk.build_url.as_deref(), Some("https://jenkins/job/7/"));
+        assert_eq!(jk.change_url.as_deref(), Some("https://bitbucket/pr/5"));
+        let push = Origin::resolve_with(
+            &OriginFlags::default(),
+            env_of(&[
+                ("GITHUB_SERVER_URL", "https://github.com"),
+                ("GITHUB_REPOSITORY", "a/b"),
+                ("GITHUB_REF", "refs/heads/main"),
+            ]),
+        );
+        assert_eq!(push.change_url, None);
+    }
+
+    #[test]
+    fn origin_adds_only_known_fields_to_the_payload() {
+        let mut map = serde_json::Map::new();
+        Origin {
+            tickets: vec!["ORD-7".into()],
+            note: Some("why".into()),
+            ..Origin::default()
+        }
+        .apply_to_payload(&mut map);
+        assert_eq!(
+            Value::Object(map),
+            json!({"tickets": ["ORD-7"], "note": "why"})
+        );
     }
 
     #[test]
