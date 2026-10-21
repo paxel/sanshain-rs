@@ -149,7 +149,9 @@ The build and change URL default to the runner's own variables on GitHub Actions
 (`GITHUB_SERVER_URL`, `GITHUB_REPOSITORY`, `GITHUB_RUN_ID`, a pull request's `GITHUB_REF`), GitLab
 CI (`CI_JOB_URL`, `CI_MERGE_REQUEST_PROJECT_URL`, `CI_MERGE_REQUEST_IID`) and Jenkins (`BUILD_URL`,
 `CHANGE_URL`); tickets and the note come only from the pipeline. The latest provide that carries
-any of it wins; a byte-identical re-provide only fills an empty origin. Nothing is read from git.
+any of it wins; a byte-identical re-provide only fills an empty origin. Nothing is read from git. A service before 2.9.0
+refuses the origin fields; the subcommand then warns and repeats the provide without them, so
+upgrading the client first never fails a build.
 
 ## Strict mode and best effort
 

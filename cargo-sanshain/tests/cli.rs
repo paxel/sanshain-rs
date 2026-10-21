@@ -900,6 +900,29 @@ fn provide_sends_the_origin_of_the_build() {
 }
 
 #[test]
+fn an_older_service_refusing_the_origin_gets_the_provide_without_it() {
+    let (url, handle) = mock_server(vec![
+        http_response(
+            "422 Unprocessable Entity",
+            "Failed to deserialize the JSON body into the target type: unknown field `note`",
+        ),
+        stored_response(),
+    ]);
+    let dir = provide_project("origin_old_server", &url);
+    let output = run(&dir, &["provide", "--note", "Adds users"], &[]);
+    assert_success(&output);
+    assert!(
+        stderr(&output).contains("does not take the build's origin"),
+        "{}",
+        stderr(&output)
+    );
+    let requests = joined_requests(handle);
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    assert!(requests[0].contains(r#""note":"Adds users""#));
+    assert!(!requests[1].contains("note"), "{}", requests[1]);
+}
+
+#[test]
 fn local_trunk_and_tag_fail_under_strict_before_any_request() {
     // Nothing listens on port 9: a request would fail differently.
     let dir = provide_project("trunk_and_tag_strict", "http://127.0.0.1:9");

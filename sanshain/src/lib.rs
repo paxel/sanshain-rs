@@ -229,6 +229,18 @@ impl Origin {
     }
 }
 
+/// What a provide prints when an older service refused the origin and the
+/// provide was repeated without it.
+pub const ORIGIN_DROPPED_WARNING: &str =
+    "Sanshain Service before 2.9.0 does not take the build's origin; providing without it";
+
+/// Whether a `422` body names one of the origin fields as unknown.
+pub(crate) fn origin_field_refused(body: &str) -> bool {
+    ["build_url", "change_url", "tickets", "note"]
+        .iter()
+        .any(|field| body.contains(&format!("unknown field `{field}`")))
+}
+
 /// The first value that is not blank, trimmed.
 fn first(values: &[Option<String>]) -> Option<String> {
     values
@@ -1489,11 +1501,32 @@ impl Client {
             stability,
             &self.stream,
         );
+        let plain = payload.clone();
         if let Some(map) = payload.as_object_mut() {
             self.origin.apply_to_payload(map);
         }
         let url = format!("{}{}", self.base_url, entry.api_type.provide_path());
-        match self.with_auth(ureq::post(&url)).send_json(payload) {
+        let sent = match self.with_auth(ureq::post(&url)).send_json(payload) {
+            // A service before 2.9.0 refuses the origin fields by name: the
+            // provide must not fail for a fact the service cannot store, so it
+            // is repeated without them.
+            Err(ureq::Error::Status(422, response)) if !self.origin.is_empty() => {
+                self.record_warnings(&response);
+                let body = response.into_string().unwrap_or_default();
+                if !origin_field_refused(&body) {
+                    return Err(Error::Api(provide_error_message(
+                        422,
+                        &body,
+                        entry.api_type,
+                        &entry.file,
+                    )));
+                }
+                eprintln!("warning: {ORIGIN_DROPPED_WARNING}");
+                self.with_auth(ureq::post(&url)).send_json(plain)
+            }
+            other => other,
+        };
+        match sent {
             Ok(response) => {
                 self.record_warnings(&response);
                 Ok(response.into_json()?)
