@@ -561,7 +561,14 @@ fn catalog_returns_the_recorded_resources() {
         ]
     );
     let requests = joined_requests(handle);
-    assert!(requests[0].contains("Authorization: Bearer tok"));
+    // Header names are case-insensitive; ureq 3 writes them in lower case.
+    assert!(
+        requests[0]
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("authorization: Bearer tok")),
+        "{}",
+        requests[0]
+    );
 }
 
 #[test]

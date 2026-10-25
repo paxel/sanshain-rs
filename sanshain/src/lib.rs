@@ -19,6 +19,7 @@ use serde_yaml_ng::Value as YamlValue;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
+use std::time::Duration;
 use thiserror::Error;
 
 /// Environment variable that switches provides to GA stability (`true` or `1`).
@@ -1408,6 +1409,67 @@ pub struct Client {
     origin: Origin,
     /// Every [`WARNING_HEADER`] value received and not yet taken.
     warnings: Mutex<Vec<String>>,
+    agent: ureq::Agent,
+}
+
+type Response = ureq::http::Response<ureq::Body>;
+
+/// Why a call did not succeed: the server answered with an error status, or
+/// the request never got an answer.
+enum Failure {
+    Status(u16, Box<Response>),
+    Transport(ureq::Error),
+}
+
+/// Sorts an answer into success or [`Failure`]: like ureq 2, an error status
+/// keeps its response, so its body and warnings can still be read.
+fn checked(
+    sent: std::result::Result<Response, ureq::Error>,
+) -> std::result::Result<Response, Failure> {
+    match sent {
+        Ok(response) if response.status().as_u16() >= 400 => Err(Failure::Status(
+            response.status().as_u16(),
+            Box::new(response),
+        )),
+        Ok(response) => Ok(response),
+        Err(err) => Err(Failure::Transport(err)),
+    }
+}
+
+/// The body as text; an unreadable body is an [`Error::Http`].
+fn body_string(response: &mut Response) -> Result<String> {
+    response
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| Error::Http(e.to_string()))
+}
+
+fn body_json<T: serde::de::DeserializeOwned>(response: &mut Response) -> Result<T> {
+    Ok(serde_json::from_str(&body_string(response)?)?)
+}
+
+/// Sends `payload` as compact JSON with a Content-Length, as ureq 2 did;
+/// ureq 3's own `send_json` pretty-prints.
+fn send_json(
+    request: ureq::RequestBuilder<ureq::typestate::WithBody>,
+    payload: &impl serde::Serialize,
+) -> std::result::Result<Response, ureq::Error> {
+    let body = serde_json::to_vec(payload)?;
+    request.content_type("application/json").send(&body[..])
+}
+
+/// The agent every call goes through, configured like ureq 2's defaults so
+/// that the upgrade changes nothing for a build: no proxy from the
+/// environment, a 30 second connect timeout and at most 5 redirects. Error
+/// statuses are answers, not errors, so their body can be reported.
+fn agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .proxy(None)
+        .timeout_connect(Some(Duration::from_secs(30)))
+        .max_redirects(5)
+        .build()
+        .into()
 }
 
 impl Client {
@@ -1422,6 +1484,7 @@ impl Client {
             stream: Stream::None,
             origin: Origin::default(),
             warnings: Mutex::new(Vec::new()),
+            agent: agent(),
         }
     }
 
@@ -1470,17 +1533,22 @@ impl Client {
     }
 
     /// Keeps the response's warnings — read before the body consumes it.
-    fn record_warnings(&self, response: &ureq::Response) {
-        let found = response.all(WARNING_HEADER);
-        if !found.is_empty() {
-            self.lock_warnings()
-                .extend(found.into_iter().map(str::to_string));
+    fn record_warnings(&self, response: &Response) {
+        let mut found = response
+            .headers()
+            .get_all(WARNING_HEADER)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .map(str::to_string)
+            .peekable();
+        if found.peek().is_some() {
+            self.lock_warnings().extend(found);
         }
     }
 
-    fn with_auth(&self, request: ureq::Request) -> ureq::Request {
+    fn with_auth<B>(&self, request: ureq::RequestBuilder<B>) -> ureq::RequestBuilder<B> {
         match &self.token {
-            Some(token) => request.set("Authorization", &format!("Bearer {token}")),
+            Some(token) => request.header("Authorization", format!("Bearer {token}")),
             None => request,
         }
     }
@@ -1506,13 +1574,13 @@ impl Client {
             self.origin.apply_to_payload(map);
         }
         let url = format!("{}{}", self.base_url, entry.api_type.provide_path());
-        let sent = match self.with_auth(ureq::post(&url)).send_json(payload) {
+        let sent = match checked(send_json(self.with_auth(self.agent.post(&url)), &payload)) {
             // A service before 2.9.0 refuses the origin fields by name: the
             // provide must not fail for a fact the service cannot store, so it
             // is repeated without them.
-            Err(ureq::Error::Status(422, response)) if !self.origin.is_empty() => {
+            Err(Failure::Status(422, mut response)) if !self.origin.is_empty() => {
                 self.record_warnings(&response);
-                let body = response.into_string().unwrap_or_default();
+                let body = body_string(&mut response).unwrap_or_default();
                 if !origin_field_refused(&body) {
                     return Err(Error::Api(provide_error_message(
                         422,
@@ -1522,14 +1590,14 @@ impl Client {
                     )));
                 }
                 eprintln!("warning: {ORIGIN_DROPPED_WARNING}");
-                self.with_auth(ureq::post(&url)).send_json(plain)
+                checked(send_json(self.with_auth(self.agent.post(&url)), &plain))
             }
             other => other,
         };
         match sent {
-            Ok(response) => {
+            Ok(mut response) => {
                 self.record_warnings(&response);
-                Ok(response.into_json()?)
+                body_json(&mut response)
             }
             Err(err) => Err(self.map_failure(err, |status, body, _| {
                 provide_error_message(status, body, entry.api_type, &entry.file)
@@ -1550,13 +1618,13 @@ impl Client {
     /// or the server answers `403`.
     pub fn retire(&self, producername: &str, api_type: ApiType) -> Result<RetiredProtocol> {
         let url = format!("{}{}", self.base_url, api_type.provide_path());
-        match self
-            .with_auth(ureq::post(&url))
-            .send_json(retire_payload(producername))
-        {
-            Ok(response) => {
+        match checked(send_json(
+            self.with_auth(self.agent.post(&url)),
+            &retire_payload(producername),
+        )) {
+            Ok(mut response) => {
                 self.record_warnings(&response);
-                Ok(response.into_json()?)
+                body_json(&mut response)
             }
             Err(err) => Err(self.map_failure(err, |status, body, _| {
                 retire_error_message(status, body, producername)
@@ -1570,25 +1638,28 @@ impl Client {
     pub fn require(&self, consumername: &str, entry: &RequireEntry) -> Result<PathBuf> {
         let result = if entry.endpoints.len() == 1 {
             let url = format!("{}{}", self.base_url, entry.api_type.require_path());
-            let mut request = self.with_auth(ureq::get(&url));
+            let mut request = self.with_auth(self.agent.get(&url));
             for (key, value) in
                 require_query(consumername, entry, &entry.endpoints[0], &self.stream)
             {
                 request = request.query(key, value);
             }
-            request.call()
+            checked(request.call())
         } else {
             let url = format!("{}/require-bundle", self.base_url);
-            let mut request = self.with_auth(ureq::post(&url));
+            let mut request = self.with_auth(self.agent.post(&url));
             for (key, value) in format_query(entry) {
                 request = request.query(key, value);
             }
-            request.send_json(require_bundle_payload(consumername, entry, &self.stream))
+            checked(send_json(
+                request,
+                &require_bundle_payload(consumername, entry, &self.stream),
+            ))
         };
         match result {
-            Ok(response) => {
+            Ok(mut response) => {
                 self.record_warnings(&response);
-                let body = response.into_string()?;
+                let body = body_string(&mut response)?;
                 // Checked before anything is written: an older service that
                 // ignored `format` must not leave AsyncAPI where the build
                 // expects OpenAPI.
@@ -1639,13 +1710,13 @@ impl Client {
             self.base_url,
             encode_path_segment(service_name)
         );
-        match self
-            .with_auth(ureq::put(&url))
-            .send_json(catalog_payload(&content, &self.stream))
-        {
-            Ok(response) => {
+        match checked(send_json(
+            self.with_auth(self.agent.put(&url)),
+            &catalog_payload(&content, &self.stream),
+        )) {
+            Ok(mut response) => {
                 self.record_warnings(&response);
-                Ok(response.into_json()?)
+                body_json(&mut response)
             }
             Err(err) => Err(self.map_failure(err, |status, body, server_version| {
                 catalog_error_message(status, body, server_version)
@@ -1657,11 +1728,11 @@ impl Client {
     /// the confusing error with a clear upgrade message. There is no preflight —
     /// successful calls never trigger this. `describe` also gets the reported
     /// version, when the server named one.
-    fn map_failure<F>(&self, err: ureq::Error, describe: F) -> Error
+    fn map_failure<F>(&self, err: Failure, describe: F) -> Error
     where
         F: FnOnce(u16, &str, Option<&str>) -> String,
     {
-        if let ureq::Error::Status(_, response) = &err {
+        if let Failure::Status(_, response) = &err {
             self.record_warnings(response);
         }
         let server_version = self.server_version();
@@ -1672,18 +1743,18 @@ impl Client {
             return Error::WrongServer(message);
         }
         match err {
-            ureq::Error::Status(status, response) => {
-                let body = response.into_string().unwrap_or_default();
+            Failure::Status(status, mut response) => {
+                let body = body_string(&mut response).unwrap_or_default();
                 Error::Api(describe(status, &body, server_version.as_deref()))
             }
-            transport => Error::Http(transport.to_string()),
+            Failure::Transport(transport) => Error::Http(transport.to_string()),
         }
     }
 
     fn server_version(&self) -> Option<String> {
         let url = format!("{}/version", self.base_url);
-        let response = self.with_auth(ureq::get(&url)).call().ok()?;
-        let body: Value = response.into_json().ok()?;
+        let mut response = checked(self.with_auth(self.agent.get(&url)).call()).ok()?;
+        let body: Value = body_json(&mut response).ok()?;
         Some(body.get("version")?.as_str()?.to_string())
     }
 }

@@ -468,6 +468,28 @@ fn catalog_prints_the_recorded_resources() {
 }
 
 #[test]
+fn proxy_variables_in_the_environment_are_ignored() {
+    let (url, handle) = mock_server(vec![http_response(
+        "200 OK",
+        r#"{"system":"orders-service","trunk":true,"resources":[]}"#,
+    )]);
+    let dir = catalog_project("catalog_no_proxy", &url, "catalogInfo: catalog-info.yaml\n");
+    // Nothing listens on port 9: a client that took the proxy would fail.
+    let proxy = "http://127.0.0.1:9";
+    let output = run(
+        &dir,
+        &["catalog", "--trunk"],
+        &[
+            ("HTTP_PROXY", proxy),
+            ("http_proxy", proxy),
+            ("ALL_PROXY", proxy),
+        ],
+    );
+    assert_success(&output);
+    assert_eq!(joined_requests(handle).len(), 1);
+}
+
+#[test]
 fn catalog_on_a_dev_build_reports_the_dev_graph() {
     let (url, handle) = mock_server(vec![http_response(
         "200 OK",
