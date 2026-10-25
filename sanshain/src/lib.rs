@@ -13,6 +13,26 @@
 //! proto). Every provide declares a stability: `snapshot` by default, `ga` only
 //! via the explicit switch (`SANSHAIN_GA=true` or the CLI's `--ga`).
 
+// Shipped code may not use `unsafe` and may not panic: no unwrap, expect or
+// panic or unreachable, no indexing or slicing that can go out of bounds, no
+// arithmetic that can overflow. Unit tests are exempt via `cfg(test)`; integration tests are
+// separate crates.
+#![forbid(unsafe_code)]
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects
+    )
+)]
+
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::fs;
@@ -1778,12 +1798,10 @@ impl Client {
     /// `outputDirectory`. Returns the path of the written file. A single
     /// endpoint uses `GET /require*`; several use `POST /require-bundle`.
     pub fn require(&self, consumername: &str, entry: &RequireEntry) -> Result<PathBuf> {
-        let result = if entry.endpoints.len() == 1 {
+        let result = if let [endpoint] = entry.endpoints.as_slice() {
             let url = format!("{}{}", self.base_url, entry.api_type.require_path());
             let mut request = self.with_auth(self.agent.get(&url));
-            for (key, value) in
-                require_query(consumername, entry, &entry.endpoints[0], &self.stream)
-            {
+            for (key, value) in require_query(consumername, entry, endpoint, &self.stream) {
                 request = request.query(key, value);
             }
             checked(request.call())

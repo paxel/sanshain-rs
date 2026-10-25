@@ -1,3 +1,23 @@
+// Shipped code may not use `unsafe` and may not panic: no unwrap, expect or
+// panic or unreachable, no indexing or slicing that can go out of bounds, no
+// arithmetic that can overflow. Unit tests are exempt via `cfg(test)`; integration tests are
+// separate crates.
+#![forbid(unsafe_code)]
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects
+    )
+)]
+
 use anyhow::bail;
 use clap::{Parser, Subcommand};
 use sanshain::{
