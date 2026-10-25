@@ -15,7 +15,6 @@
 
 use serde::Deserialize;
 use serde_json::{Value, json};
-use serde_yaml_ng::Value as YamlValue;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
@@ -278,14 +277,12 @@ fn runner_change_url(env: &impl Fn(&str) -> Option<String>) -> Option<String> {
         present(&env("GITHUB_SERVER_URL")),
         present(&env("GITHUB_REPOSITORY")),
         present(&env("GITHUB_REF")),
-    ) {
-        if let Some(number) = git_ref
-            .strip_prefix("refs/pull/")
-            .and_then(|rest| rest.split('/').next())
-            .filter(|n| !n.is_empty())
-        {
-            return Some(format!("{server}/{repo}/pull/{number}"));
-        }
+    ) && let Some(number) = git_ref
+        .strip_prefix("refs/pull/")
+        .and_then(|rest| rest.split('/').next())
+        .filter(|n| !n.is_empty())
+    {
+        return Some(format!("{server}/{repo}/pull/{number}"));
     }
     if let (Some(project), Some(iid)) = (
         present(&env("CI_MERGE_REQUEST_PROJECT_URL")),
@@ -654,47 +651,195 @@ const KNOWN_REQUIRE_FIELDS: &[&str] = &[
 ];
 const KNOWN_ENDPOINT_FIELDS: &[&str] = &["method", "path"];
 
+/// Parser options, as in the Sanshain service: only `true` and `false` are
+/// booleans (YAML 1.2), so `no` or `on` stays the string it was written as,
+/// and duplicate keys are an error. The node and event budgets are raised so
+/// a document at the service's 4 MiB body limit still parses.
+fn yaml_options() -> serde_saphyr::Options {
+    serde_saphyr::options! {
+        strict_booleans: true,
+        budget: serde_saphyr::budget! {
+            max_nodes: 4_000_000,
+            max_events: 8_000_000,
+        },
+    }
+}
+
+fn from_yaml<T: serde::de::DeserializeOwned>(yaml: &str) -> std::result::Result<T, String> {
+    serde_saphyr::from_str_with_options(yaml, yaml_options()).map_err(|e| e.to_string())
+}
+
+/// The shape of a YAML document, mappings in the order of the file: all the
+/// unknown-field report needs. A key that is not a string reads as its
+/// spelling (`200`, `true`).
+#[derive(Debug)]
+enum YamlNode {
+    Mapping(Vec<(String, YamlNode)>),
+    Sequence(Vec<YamlNode>),
+    Scalar,
+}
+
+impl YamlNode {
+    fn entries(&self) -> &[(String, YamlNode)] {
+        match self {
+            YamlNode::Mapping(entries) => entries,
+            _ => &[],
+        }
+    }
+
+    fn items(&self) -> &[YamlNode] {
+        match self {
+            YamlNode::Sequence(items) => items,
+            _ => &[],
+        }
+    }
+
+    fn from_json(value: &Value) -> Self {
+        match value {
+            Value::Object(map) => YamlNode::Mapping(
+                map.iter()
+                    .map(|(k, v)| (k.clone(), YamlNode::from_json(v)))
+                    .collect(),
+            ),
+            Value::Array(items) => {
+                YamlNode::Sequence(items.iter().map(YamlNode::from_json).collect())
+            }
+            _ => YamlNode::Scalar,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for YamlNode {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        deserializer.deserialize_any(NodeVisitor)
+    }
+}
+
+struct NodeVisitor;
+
+impl<'de> serde::de::Visitor<'de> for NodeVisitor {
+    type Value = YamlNode;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a YAML node")
+    }
+    fn visit_bool<E>(self, _: bool) -> std::result::Result<YamlNode, E> {
+        Ok(YamlNode::Scalar)
+    }
+    fn visit_i64<E>(self, _: i64) -> std::result::Result<YamlNode, E> {
+        Ok(YamlNode::Scalar)
+    }
+    fn visit_u64<E>(self, _: u64) -> std::result::Result<YamlNode, E> {
+        Ok(YamlNode::Scalar)
+    }
+    fn visit_f64<E>(self, _: f64) -> std::result::Result<YamlNode, E> {
+        Ok(YamlNode::Scalar)
+    }
+    fn visit_str<E>(self, _: &str) -> std::result::Result<YamlNode, E> {
+        Ok(YamlNode::Scalar)
+    }
+    fn visit_unit<E>(self) -> std::result::Result<YamlNode, E> {
+        Ok(YamlNode::Scalar)
+    }
+    fn visit_none<E>(self) -> std::result::Result<YamlNode, E> {
+        Ok(YamlNode::Scalar)
+    }
+    fn visit_some<D: serde::Deserializer<'de>>(
+        self,
+        d: D,
+    ) -> std::result::Result<YamlNode, D::Error> {
+        YamlNode::deserialize(d)
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(
+        self,
+        mut seq: A,
+    ) -> std::result::Result<YamlNode, A::Error> {
+        let mut items = Vec::new();
+        while let Some(item) = seq.next_element()? {
+            items.push(item);
+        }
+        Ok(YamlNode::Sequence(items))
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(
+        self,
+        mut map: A,
+    ) -> std::result::Result<YamlNode, A::Error> {
+        let mut entries = Vec::new();
+        while let Some(KeyText(key)) = map.next_key()? {
+            entries.push((key, map.next_value()?));
+        }
+        Ok(YamlNode::Mapping(entries))
+    }
+}
+
+/// A mapping key as text.
+struct KeyText(String);
+
+impl<'de> Deserialize<'de> for KeyText {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        deserializer.deserialize_any(KeyVisitor)
+    }
+}
+
+struct KeyVisitor;
+
+impl serde::de::Visitor<'_> for KeyVisitor {
+    type Value = KeyText;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a scalar mapping key")
+    }
+    fn visit_bool<E>(self, v: bool) -> std::result::Result<KeyText, E> {
+        Ok(KeyText(v.to_string()))
+    }
+    fn visit_i64<E>(self, v: i64) -> std::result::Result<KeyText, E> {
+        Ok(KeyText(v.to_string()))
+    }
+    fn visit_u64<E>(self, v: u64) -> std::result::Result<KeyText, E> {
+        Ok(KeyText(v.to_string()))
+    }
+    fn visit_f64<E>(self, v: f64) -> std::result::Result<KeyText, E> {
+        Ok(KeyText(v.to_string()))
+    }
+    fn visit_str<E>(self, v: &str) -> std::result::Result<KeyText, E> {
+        Ok(KeyText(v.to_string()))
+    }
+    fn visit_unit<E>(self) -> std::result::Result<KeyText, E> {
+        Ok(KeyText("null".to_string()))
+    }
+}
+
 /// Appends `prefix` + each key of `value` not in `known` to `out`, in order.
-fn collect_unknown(value: &YamlValue, known: &[&str], prefix: &str, out: &mut Vec<String>) {
-    for key in value.as_mapping().into_iter().flat_map(|m| m.keys()) {
-        let key = yaml_key(key);
+fn collect_unknown(value: &YamlNode, known: &[&str], prefix: &str, out: &mut Vec<String>) {
+    for (key, _) in value.entries() {
         if !known.contains(&key.as_str()) {
             out.push(format!("{prefix}{key}"));
         }
     }
 }
 
-fn yaml_key(key: &YamlValue) -> String {
-    match key.as_str() {
-        Some(key) => key.to_string(),
-        None => serde_yaml_ng::to_string(key)
-            .map(|k| k.trim_end().to_string())
-            .unwrap_or_default(),
-    }
-}
-
 /// Every unknown field of a configuration, as a path, in document order —
 /// read from the YAML value, whose mappings keep the order of the file.
-fn unknown_fields(value: &YamlValue) -> Vec<String> {
+fn unknown_fields(value: &YamlNode) -> Vec<String> {
     let mut out = Vec::new();
-    for (key, value) in value.as_mapping().into_iter().flatten() {
-        let key = yaml_key(key);
+    for (key, value) in value.entries() {
         match key.as_str() {
             "provide" => collect_unknown(value, KNOWN_PROVIDE_FIELDS, "provide.", &mut out),
             "provides" => {
-                for (i, entry) in value.as_sequence().into_iter().flatten().enumerate() {
+                for (i, entry) in value.items().iter().enumerate() {
                     let prefix = format!("provides[{i}].");
                     collect_unknown(entry, KNOWN_PROVIDE_FIELDS, &prefix, &mut out);
                 }
             }
             "requires" => {
-                for (i, entry) in value.as_sequence().into_iter().flatten().enumerate() {
-                    for (field, field_value) in entry.as_mapping().into_iter().flatten() {
-                        let field = yaml_key(field);
+                for (i, entry) in value.items().iter().enumerate() {
+                    for (field, field_value) in entry.entries() {
                         if field == "endpoints" {
-                            for (j, endpoint) in
-                                field_value.as_sequence().into_iter().flatten().enumerate()
-                            {
+                            for (j, endpoint) in field_value.items().iter().enumerate() {
                                 let prefix = format!("requires[{i}].endpoints[{j}].");
                                 collect_unknown(endpoint, KNOWN_ENDPOINT_FIELDS, &prefix, &mut out);
                             }
@@ -959,11 +1104,11 @@ impl Config {
     /// Order: YAML parse, legacy-field rejections, unknown-field detection,
     /// then every other validation.
     pub fn load_yaml_str(yaml: &str) -> Result<LoadedConfig> {
-        let yaml_value: YamlValue = serde_yaml_ng::from_str(yaml).map_err(invalid)?;
-        let value = serde_json::to_value(&yaml_value).map_err(invalid)?;
+        let value: Value = from_yaml(yaml).map_err(invalid)?;
         let obj = as_mapping(&value)?;
         check_legacy_fields(obj)?;
-        let unknown_fields = unknown_fields(&yaml_value);
+        // Read a second time for the key order: serde_json's maps sort keys.
+        let unknown_fields = unknown_fields(&from_yaml::<YamlNode>(yaml).map_err(invalid)?);
         Ok(LoadedConfig {
             strict: obj.get("strict").and_then(Value::as_bool).unwrap_or(false),
             config: validate(&value, unknown_fields.clone()),
@@ -978,9 +1123,7 @@ impl Config {
     /// (in the map's order — file order only when loaded from YAML).
     pub fn from_value(value: &Value) -> Result<Self> {
         check_legacy_fields(as_mapping(value)?)?;
-        let unknown_fields = serde_yaml_ng::to_value(value)
-            .map(|yaml| unknown_fields(&yaml))
-            .unwrap_or_default();
+        let unknown_fields = unknown_fields(&YamlNode::from_json(value));
         validate(value, unknown_fields)
     }
 }
@@ -1166,9 +1309,8 @@ fn format_query(entry: &RequireEntry) -> Vec<(&'static str, &'static str)> {
 /// key). A service predating `format` ignores the parameter and answers in
 /// the entry's own format instead.
 fn is_openapi_document(body: &str) -> bool {
-    serde_yaml_ng::from_str::<serde_yaml_ng::Value>(body)
-        .ok()
-        .and_then(|doc| doc.as_mapping().map(|m| m.contains_key("openapi")))
+    from_yaml::<YamlNode>(body)
+        .map(|doc| doc.entries().iter().any(|(key, _)| key == "openapi"))
         .unwrap_or(false)
 }
 
@@ -1344,10 +1486,10 @@ fn recorded_by_default() -> bool {
 /// trunk build, and a tag never does: the payload denies unknown fields.
 pub(crate) fn catalog_payload(content: &str, stream: &Stream) -> Value {
     let mut payload = json!({ "catalog_info_yaml": content });
-    if stream.is_trunk() {
-        if let Some(map) = payload.as_object_mut() {
-            map.insert("trunk".to_string(), Value::Bool(true));
-        }
+    if stream.is_trunk()
+        && let Some(map) = payload.as_object_mut()
+    {
+        map.insert("trunk".to_string(), Value::Bool(true));
     }
     payload
 }
@@ -2026,6 +2168,42 @@ mod tests {
                 "   /\\_/\\  ?\n  ( O_o )   sanshain.yaml: unknown field 'catalogInf' - ignored\n ---U-U---"
             )
         );
+    }
+
+    #[test]
+    fn a_key_that_is_not_a_string_is_reported_by_its_spelling() {
+        assert_eq!(
+            unknown("serviceName: s\n200: x\ntrue: y\n"),
+            ["200", "true"]
+        );
+    }
+
+    #[test]
+    fn only_true_and_false_are_booleans() {
+        let loaded = Config::load_yaml_str("serviceName: s\nstrict: yes\n");
+        assert_eq!(loaded.map(|l| l.strict).ok(), Some(false));
+    }
+
+    #[test]
+    fn a_duplicate_key_is_a_configuration_error() {
+        assert!(Config::from_yaml_str("serviceName: s\nserviceName: t\n").is_err());
+    }
+
+    #[test]
+    fn requires_entries_can_share_settings_through_a_merge_key() {
+        let config = match Config::from_yaml_str(
+            "serviceName: s\nrequires:\n  - &u\n    serviceName: u\n    version: 1.0.0\n    outputDirectory: out\n    endpoints:\n      - method: GET\n        path: /a\n  - <<: *u\n    outputDirectory: out2\n",
+        ) {
+            Ok(config) => config,
+            Err(err) => panic!("expected the config to parse, got {err}"),
+        };
+        assert!(
+            config.unknown_fields.is_empty(),
+            "{:?}",
+            config.unknown_fields
+        );
+        assert_eq!(config.requires[1].service_name, "u");
+        assert_eq!(config.requires[1].output_directory, PathBuf::from("out2"));
     }
 
     #[test]

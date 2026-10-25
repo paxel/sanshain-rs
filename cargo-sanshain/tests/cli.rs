@@ -109,10 +109,10 @@ fn project(name: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("cli")
         .join(name);
-    if dir.exists() {
-        if let Err(err) = std::fs::remove_dir_all(&dir) {
-            panic!("failed to clear {}: {err}", dir.display());
-        }
+    if dir.exists()
+        && let Err(err) = std::fs::remove_dir_all(&dir)
+    {
+        panic!("failed to clear {}: {err}", dir.display());
     }
     if let Err(err) = std::fs::create_dir_all(&dir) {
         panic!("failed to create {}: {err}", dir.display());
@@ -121,10 +121,10 @@ fn project(name: &str) -> PathBuf {
 }
 
 fn write(path: &Path, content: &str) {
-    if let Some(parent) = path.parent() {
-        if let Err(err) = std::fs::create_dir_all(parent) {
-            panic!("failed to create {}: {err}", parent.display());
-        }
+    if let Some(parent) = path.parent()
+        && let Err(err) = std::fs::create_dir_all(parent)
+    {
+        panic!("failed to create {}: {err}", parent.display());
     }
     if let Err(err) = std::fs::write(path, content) {
         panic!("failed to write {}: {err}", path.display());

@@ -10,10 +10,10 @@ resolver = "2"
 [workspace.package]
 version = "3.1.0"
 edition = "2024"
-# Edition 2024 requires 1.85. Declared rather than left implicit: this is a
-# published library, so the floor is a promise to consumers, not an internal
-# detail that can move quietly.
-rust-version = "1.85"
+# serde-saphyr requires 1.89 (edition 2024 alone would allow 1.85). Declared
+# rather than left implicit: this is a published library, so the floor is a
+# promise to consumers, not an internal detail that can move quietly.
+rust-version = "1.89"
 authors = ["Patrick Zimmer"]
 license = "Apache-2.0"
 repository = "https://github.com/paxel/sanshain-rs"
