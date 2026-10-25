@@ -4,7 +4,7 @@
 # Built against `stable` rather than a pinned toolchain, deliberately: this is a
 # published library, so the useful signal is whether it still compiles for the
 # toolchain consumers actually run. The floor consumers may rely on is the
-# `rust-version` in the workspace manifest.
+# `rust-version` in the workspace manifest; the msrv job tests it.
 name: CI
 
 # Push covers the working branches; pull_request covers forks. A push that also
@@ -39,5 +39,17 @@ jobs:
         run: cargo fmt --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Tests
+        run: cargo test --workspace --locked
+
+  # The README promises this floor, so it is built and tested, not just declared.
+  # Keep in sync with `rust-version` in the workspace Cargo.toml.
+  msrv:
+    name: MSRV (1.89)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.89
+      - uses: Swatinem/rust-cache@v2
       - name: Tests
         run: cargo test --workspace --locked
