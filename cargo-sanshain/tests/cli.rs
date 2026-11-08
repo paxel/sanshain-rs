@@ -411,12 +411,99 @@ fn best_effort_does_not_soften_strict() {
 }
 
 #[test]
-fn an_unloadable_config_is_a_warning_only_with_best_effort_from_flag_or_env() {
+fn an_unloadable_config_fails_also_with_best_effort() {
     let dir = project("no_config");
     assert_failure(&run(&dir, &["provide"], &[]));
-    let output = run(&dir, &["provide"], &[("SANSHAIN_BEST_EFFORT", "1")]);
+    for (args, envs) in [
+        (&["provide"][..], &[("SANSHAIN_BEST_EFFORT", "1")][..]),
+        (&["require", "--best-effort"][..], &[][..]),
+        (&["catalog", "--best-effort"][..], &[][..]),
+    ] {
+        let output = run(&dir, args, envs);
+        assert_failure(&output);
+        let err = stderr(&output);
+        assert!(err.contains("cannot read"), "unexpected stderr: {err}");
+        assert!(!err.contains("best effort"), "unexpected stderr: {err}");
+    }
+}
+
+#[test]
+fn an_invalid_config_fails_also_with_best_effort() {
+    let dir = project("invalid_config_best_effort");
+    write(
+        &dir.join("sanshain.yaml"),
+        "serviceName: demo-service\nbestEffort: true\nprovides:\n  - file: specs/openapi.yaml\n    apiType: raml\n",
+    );
+    let output = run(&dir, &["provide", "--best-effort"], &[]);
+    assert_failure(&output);
+    let err = stderr(&output);
+    assert!(
+        err.contains("invalid sanshain.yaml"),
+        "unexpected stderr: {err}"
+    );
+    assert!(!err.contains("best effort"), "unexpected stderr: {err}");
+}
+
+#[test]
+fn best_effort_provide_goes_on_after_a_failed_call() {
+    let dir = project("be_provide_next");
+    write_spec(&dir);
+    write(
+        &dir.join("specs/second.yaml"),
+        "openapi: 3.0.3\ninfo:\n  title: Second\n  version: 1.0.0\npaths: {}\n",
+    );
+    let (url, handle) = mock_server(vec![
+        conflict_response(),
+        version_response("2.3.0"),
+        http_response(
+            "202 Accepted",
+            r#"{"version":"1.0.0","stability":"snapshot","content_hash":"sha256:abc","changes":{"inserts":1,"updates":0,"deletes":0}}"#,
+        ),
+    ]);
+    write(
+        &dir.join("sanshain.yaml"),
+        &format!(
+            "serviceName: demo-service\nsanshainUrl: {url}\nprovides:\n  - file: specs/openapi.yaml\n  - file: specs/second.yaml\n"
+        ),
+    );
+    let output = run(&dir, &["provide", "--best-effort"], &[]);
     assert_success(&output);
-    assert!(stderr(&output).contains("Warning loading config"));
+    let err = stderr(&output);
+    assert!(err.contains("Publish as 1.5.0"), "unexpected stderr: {err}");
+    assert!(
+        err.contains("Continuing (best effort)"),
+        "unexpected stderr: {err}"
+    );
+    assert!(
+        !err.contains("No specification files found"),
+        "unexpected stderr: {err}"
+    );
+    assert!(
+        stdout(&output).contains("Stored version 1.0.0"),
+        "unexpected stdout: {}",
+        stdout(&output)
+    );
+    assert_eq!(joined_requests(handle).len(), 3);
+}
+
+#[test]
+fn a_missing_url_fails_under_strict_also_with_best_effort() {
+    let dir = project("strict_no_url");
+    write_spec(&dir);
+    write(&dir.join("catalog-info.yaml"), "kind: Component\n");
+    write(
+        &dir.join("sanshain.yaml"),
+        "serviceName: demo-service\nstrict: true\ncatalogInfo: catalog-info.yaml\nprovides:\n  - file: specs/openapi.yaml\nrequires:\n  - serviceName: user-service\n    version: 1.2.0\n    outputDirectory: out\n    endpoints:\n      - method: GET\n        path: /x\n",
+    );
+    for command in ["provide", "require", "catalog"] {
+        let output = run(&dir, &[command, "--best-effort"], &[]);
+        assert_failure(&output);
+        let err = stderr(&output);
+        assert!(
+            err.contains("strict: configuration error: missing 'sanshainUrl'"),
+            "{command}: unexpected stderr: {err}"
+        );
+    }
 }
 
 // --- the puzzled cat ---
@@ -672,17 +759,18 @@ fn the_cat_shows_before_a_later_validation_error() {
 }
 
 #[test]
-fn the_cat_shows_on_the_best_effort_fallback() {
+fn the_cat_shows_before_a_validation_error_best_effort_does_not_soften() {
     let dir = project("cat_then_fallback");
     write(&dir.join("sanshain.yaml"), TYPO_THEN_MISSING_VERSION);
     let output = run(&dir, &["require", "--best-effort"], &[]);
-    assert_success(&output);
+    assert_failure(&output);
     let err = stderr(&output);
     assert!(err.starts_with(CAT_VERISON), "unexpected stderr: {err}");
     assert!(
-        err.contains("Warning loading config") && err.contains("missing 'version'"),
+        err.contains("missing 'version'"),
         "unexpected stderr: {err}"
     );
+    assert!(!err.contains("best effort"), "unexpected stderr: {err}");
 }
 
 #[test]
