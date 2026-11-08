@@ -1699,11 +1699,20 @@ pub(crate) fn provide_error_message(
         // Releasing is a permission, not merely an authenticated act, and the
         // remedy is a role grant — nothing the Producer can change in its own
         // repository. Naming it is the whole value of catching this status.
-        403 => format!(
+        403 if names_releaser_role(&server_message) => format!(
             "provide refused (403): {server_message}\nPublishing a GA version requires the 'releaser' role. Grant it to the user or token this build authenticates as (administrators and root always hold it), or publish as a snapshot by leaving --ga / {GA_ENV_VAR} unset and autoGa off (or setting {GA_ENV_VAR}=false)."
         ),
+        403 => format!("provide refused (403): {server_message}"),
         _ => format!("provide failed ({status}): {server_message}"),
     }
+}
+
+/// Whether a 403 is the service's refusal for a caller without the releaser
+/// role. Its body carries no code, only the sentence ("… requires the
+/// 'releaser' role …"); every other 403, a read-only token's among them, is
+/// shown as the service wrote it.
+fn names_releaser_role(server_message: &str) -> bool {
+    server_message.contains("requires the 'releaser' role")
 }
 
 /// Formats a failed retire. Retiring is gated like releasing, but reachable two
@@ -1712,9 +1721,10 @@ pub(crate) fn retire_error_message(status: u16, body: &str, producername: &str) 
     let parsed: Option<ErrorBody> = serde_json::from_str(body).ok();
     let server_message = parsed.map_or_else(|| fallback_message(body), |b| b.error);
     match status {
-        403 => format!(
+        403 if names_releaser_role(&server_message) => format!(
             "retire refused (403): {server_message}\nRetiring an API family requires the 'releaser' role — which a release pipeline already holds — or a maintainer grant on '{producername}'. Administrators and root hold both."
         ),
+        403 => format!("retire refused (403): {server_message}"),
         404 => format!(
             "retire failed (404): {server_message}\nNothing was ever provided as '{producername}', so there is no family to retire."
         ),
@@ -3521,6 +3531,34 @@ requires:
             message.contains("SANSHAIN_GA=false"),
             "unexpected: {message}"
         );
+    }
+
+    const READ_ONLY_REFUSAL: &str = r#"{"error":"this API token has scope 'read_only' and may not change the catalog; create a token with scope 'full' for provide, require and catalog pushes"}"#;
+
+    #[test]
+    fn a_403_without_the_releaser_reason_shows_the_service_message_only() {
+        let message = provide_error_message(
+            403,
+            READ_ONLY_REFUSAL,
+            ApiType::OpenApi,
+            Path::new("openapi.yaml"),
+        );
+        assert_eq!(
+            message,
+            "provide refused (403): this API token has scope 'read_only' and may not change the catalog; create a token with scope 'full' for provide, require and catalog pushes"
+        );
+        let retire = retire_error_message(403, READ_ONLY_REFUSAL, "svc");
+        assert_eq!(
+            retire,
+            "retire refused (403): this API token has scope 'read_only' and may not change the catalog; create a token with scope 'full' for provide, require and catalog pushes"
+        );
+        let plain = provide_error_message(
+            403,
+            "Forbidden",
+            ApiType::OpenApi,
+            Path::new("openapi.yaml"),
+        );
+        assert_eq!(plain, "provide refused (403): Forbidden");
     }
 
     #[test]
