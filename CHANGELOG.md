@@ -14,6 +14,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Breaking Changes
 - Library: `Config` has new public fields (`auto_ga`, `annotations`), so code that builds a `Config` must be adapted.
 
+### Fixed
+- `apiType: grpc` is read as `proto` on provides and requires, as the other clients read it: a require goes to `/require/grpc` and is saved as `.proto`; the spelling was refused as an invalid `sanshain.yaml`.
+
 ---
 
 Historical changes have been moved to [OLDER_CHANGES.md](OLDER_CHANGES.md).

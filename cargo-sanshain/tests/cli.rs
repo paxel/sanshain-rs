@@ -376,6 +376,31 @@ fn best_effort_require_carries_on_with_the_next_entry() {
 }
 
 #[test]
+fn a_grpc_require_goes_to_the_grpc_route_and_is_saved_as_proto() {
+    let dir = project("require_grpc");
+    let (url, handle) = mock_server(vec![http_response("200 OK", "syntax = \"proto3\";\n")]);
+    write(
+        &dir.join("sanshain.yaml"),
+        &format!(
+            "serviceName: demo-service\nsanshainUrl: {url}\nrequires:\n  - serviceName: greeter\n    apiType: grpc\n    version: 1.0.0\n    outputDirectory: out\n    endpoints:\n      - method: SayHello\n        path: helloworld.Greeter\n"
+        ),
+    );
+    let output = run(&dir, &["require"], &[]);
+    assert_success(&output);
+    let requests = joined_requests(handle);
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0].starts_with("GET /require/grpc?"),
+        "unexpected request: {}",
+        requests[0]
+    );
+    match std::fs::read_to_string(dir.join("out/greeter.proto")) {
+        Ok(content) => assert_eq!(content, "syntax = \"proto3\";\n"),
+        Err(err) => panic!("expected out/greeter.proto: {err}"),
+    }
+}
+
+#[test]
 fn best_effort_does_not_soften_strict() {
     let dir = project("be_and_strict");
     write(

@@ -621,13 +621,15 @@ impl std::fmt::Display for Stream {
     }
 }
 
-/// The API type of a provide/require entry.
+/// The API type of a provide/require entry. `grpc` is read as `proto`, the
+/// spelling of the service's routes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ApiType {
     #[default]
     OpenApi,
     AsyncApi,
+    #[serde(alias = "grpc")]
     Proto,
 }
 
@@ -2347,6 +2349,21 @@ mod tests {
         assert_eq!(config.requires.len(), 1);
         assert_eq!(config.requires[0].version, "2.3.0");
         assert_eq!(config.requires[0].endpoints[0].method, "GET");
+    }
+
+    #[test]
+    fn grpc_is_proto_for_provides_and_requires() {
+        let mut value = valid_config_value();
+        value["provides"][1]["apiType"] = json!("grpc");
+        value["requires"][0]["apiType"] = json!("grpc");
+        let config = match Config::from_value(&value) {
+            Ok(config) => config,
+            Err(err) => panic!("expected valid config, got {err}"),
+        };
+        assert_eq!(config.provides[1].api_type, ApiType::Proto);
+        assert_eq!(config.requires[0].api_type, ApiType::Proto);
+        assert_eq!(config.requires[0].api_type.require_path(), "/require/grpc");
+        assert_eq!(config.requires[0].api_type.file_extension(), "proto");
     }
 
     #[test]
