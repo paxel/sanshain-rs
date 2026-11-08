@@ -2,7 +2,7 @@
 //! (OpenAPI, AsyncAPI, gRPC/Proto) under a producer-declared version, and
 //! **require** pinned endpoint snippets.
 //!
-//! Compatibility: **sanshain 2.x speaks Sanshain Service 2.x.** Only
+//! Compatibility: **sanshain 4.x speaks Sanshain Service 2.x.** Only
 //! [`Client::catalog`] needs Sanshain Service 2.4.0 or later, and annotations
 //! ([`Client::with_annotations`]) need 2.13.0 or later.
 //!
@@ -747,7 +747,7 @@ impl RequireFormat {
     }
 }
 
-/// Configuration from `[package.metadata.sanshain]` in `Cargo.toml`.
+/// Configuration from `sanshain.yaml` in the project root (see [`CONFIG_FILE`]).
 #[derive(Debug, Clone)]
 pub struct Config {
     pub sanshain_url: Option<String>,
