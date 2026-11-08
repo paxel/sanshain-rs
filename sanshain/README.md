@@ -1,286 +1,45 @@
 # sanshain
 
 Client library for the [Sanshain Service](https://github.com/paxel/sanshain-service).
-**Provide** a full API specification (OpenAPI, AsyncAPI, gRPC/Proto) under a
-producer-declared version, **require** pinned endpoint snippets, and **retire** a protocol
-family you no longer publish.
+**Provide** a full API specification (OpenAPI, AsyncAPI, gRPC/Proto) under the version declared
+in the spec file, **require** pinned endpoint snippets, and **retire** a protocol family you no
+longer publish.
 
-**Compatibility: `sanshain` 4.x speaks Sanshain Service 2.x.** For the command line, see
-[`cargo-sanshain`](https://crates.io/crates/cargo-sanshain).
+**The documentation lives on the Sanshain site: [Rust client](https://paxel.github.io/sanshain-service/developer/clients/rust.html),** with
+[the library API](https://paxel.github.io/sanshain-service/developer/clients/rust.html#library) for builds that embed the client. The configuration file is
+described in [`sanshain.yaml`](https://paxel.github.io/sanshain-service/developer/sanshain-yaml.html).
 
-```rust,no_run
+**Compatibility: `sanshain` 4.x speaks Sanshain Service 2.x.** Rust 1.89 or later. For the
+command line, see [`cargo-sanshain`](https://crates.io/crates/cargo-sanshain).
+
+## Install
+
+```toml
+[dependencies]
+sanshain = "4"
+```
+
+## A minimal example
+
+```rust
 use sanshain::{CONFIG_FILE, Client, Config, Stability, Stream};
 
-let config = Config::from_yaml_file(CONFIG_FILE)?;
-let Some(service_name) = config.service_name.as_deref() else {
-    return Ok(()); // no serviceName: nothing to provide as
-};
-let client = Client::from_config(&config)?.with_stream(Stream::Trunk);
-
-for entry in &config.provides {
-    let stored = client.provide(service_name, entry, Stability::Snapshot)?;
-    println!("stored {} ({})", stored.version, stored.stability);
+fn main() -> Result<(), sanshain::Error> {
+    let config = Config::from_yaml_file(CONFIG_FILE)?;
+    let Some(service_name) = config.service_name.as_deref() else {
+        return Ok(()); // no serviceName: nothing to provide as
+    };
+    let client = Client::from_config(&config)?.with_stream(Stream::Trunk);
+    for entry in &config.provides {
+        let stored = client.provide(service_name, entry, Stability::Snapshot)?;
+        println!("stored {} ({})", stored.version, stored.stability);
+    }
+    Ok(())
 }
-# Ok::<(), sanshain::Error>(())
 ```
 
-## Configuration
-
-`sanshain.yaml`, the file every Sanshain client shares:
-
-```yaml
-serviceName: gateway-service
-sanshainUrl: http://localhost:3000
-catalogInfo: catalog-info.yaml   # optional — see "Catalog" below
-
-provides:
-  - file: specs/openapi.yaml
-  - file: specs/gateway.proto
-    apiType: proto
-  - file: specs/events.yaml
-    apiType: asyncapi
-    retired: true          # no longer provided — see "Retiring" below
-
-requires:
-  - serviceName: user-service
-    version: 2.3.0
-    outputDirectory: generated/user-service
-    endpoints:
-      - method: GET
-        path: /api/v1/users/{id}
-```
-
-- **The spec version lives in the spec file**, never in the configuration: `info.version`
-  for OpenAPI/AsyncAPI, a mandatory `// sanshain-version:` comment for proto. Accepted
-  spellings are `MAJOR[.MINOR[.PATCH]]` with an optional leading `v` — omitted parts are
-  zero (`v2` becomes `2.0.0`) and the stored form is always the full three-part version.
-- **Every requires entry pins an exact version.** What your build downloads changes only
-  when someone edits `version`. A pin that does not exist fails immediately with `404`.
-- A single `provide` mapping is accepted in place of the `provides` list.
-- Relative paths (`file`, `outputDirectory`, `catalogInfo`) resolve against the directory containing
-  `sanshain.yaml` when it is loaded with [`Config::from_yaml_file`], never against the working
-  directory. Absolute paths stay absolute.
-- `autoGa: true` is read into [`Config::auto_ga`]; see [Stability](#stability).
-- `annotations` is read into [`Config::annotations`], placeholders unfilled; see
-  [Annotations](#annotations).
-- `strict: true` and `bestEffort: true` are read into [`Config::strict`] and
-  [`Config::best_effort`] for the command to act on; `SANSHAIN_STRICT` /
-  `SANSHAIN_BEST_EFFORT`, when set, override them ([`resolve_switch_with`]). A missing
-  `serviceName` parses as `None` — the command decides whether that skips or fails.
-- Configuration is validated before any network call; removed 1.x-era fields (`branch`,
-  `timeout`, `baseVersion`, `releaseBranches`, `stability`, `spec_id`, `api_key`,
-  `service_url`) are rejected by name with a migration hint.
-
-- A field no Sanshain client knows (a typo like `catalogInf` or `requires[0].verison`) is
-  collected in [`Config::unknown_fields`], in file order, after the rejections above. Fields
-  other clients know but this one does not use (`compression`, `insecure`, …) are accepted
-  silently. [`puzzled_cat`] formats the warning a command prints for them.
-
-Parsing is separate from loading: [`Config::from_value`] validates a `serde_json::Value`,
-so a caller holding configuration in another form can bypass the file entirely.
-
-## Stability
-
-Every provide declares one, and the default is always `snapshot`. GA is an explicit act
-— `Stability::Ga`, `SANSHAIN_GA=true`, or `autoGa: true` in `sanshain.yaml` on a build
-that declares a stream. There is no git or branch detection. Snapshots are overwritable and
-expire when unused; GA versions are immutable and permanently claim their number.
-
-[`Stability::resolve`] decides it; the first of these that is set wins:
-
-1. the GA flag, `Some(true)` or `Some(false)`;
-2. `SANSHAIN_GA`, unless absent or blank (an explicit `false` counts);
-3. `autoGa: true` ([`Config::auto_ga`]) on a build that declares trunk or a tag, or both;
-4. `snapshot`.
-
-```rust,no_run
-# use sanshain::{Config, Stability, Stream};
-# let config = Config::from_yaml_str("serviceName: s\nautoGa: true\n")?;
-// The stream first: autoGa asks whether the build declared one.
-let (stream, warning) = Stream::resolve(false, None);
-let declared = stream != Stream::None || warning.is_some();
-let stability = Stability::resolve(None, config.auto_ga, declared);
-# Ok::<(), sanshain::Error>(())
-```
-
-```yaml
-autoGa: true   # every trunk or tag build provides GA
-```
-
-With `autoGa: true`, CI declaring trunk (`SANSHAIN_TRUNK`) or a tag (`SANSHAIN_TAG`) is
-what makes a provide GA: CI declares them on its protected pipelines only, and a build
-without a stream — a developer's laptop — stays a snapshot. `SANSHAIN_GA=false` keeps one
-build a snapshot anyway. The CI token's user needs the `releaser` role, and a trunk build
-that changes the spec without a version bump fails with `409 immutable_ga` and the proposed
-version: bump the version in the spec file and build again. A retire never carries a
-stability, `autoGa` or not. [`resolve_stability`] predates `autoGa` and ignores it.
-
-Publishing GA requires the `releaser` role. Without it the server answers `403`, and the
-error names the role and the snapshot fallback.
-
-## Streams
-
-A build declares which dependency graph its calls belong to — trunk, a named
-sanshain-branch, or neither — via [`Stream`], set once on the [`Client`]:
-
-```rust,no_run
-# use sanshain::{Client, Stream};
-# let client = Client::new("http://localhost:3000", None);
-let (stream, warning) = Stream::resolve(false, Some("Release-Maribou"));
-if let Some(warning) = warning {
-    eprintln!("warning: {warning}");
-}
-let client = client.with_stream(stream);
-```
-
-The stream is a property of the invocation, not of the repository, so it comes from flags
-or `SANSHAIN_TRUNK` / `SANSHAIN_TAG` and never from `sanshain.yaml`. Trunk and a tag are
-mutually exclusive, and [`Stream`] cannot represent both: declaring both resolves to
-[`Stream::None`] together with the warning
-`trunk and tag are mutually exclusive - this build is recorded in neither`.
-
-## Annotations
-
-`annotations` in `sanshain.yaml` are named values Sanshain shows with the provided version
-(`scope: version`) or with the system (`scope: system`):
-
-```yaml
-annotations:
-  - scope: version
-    name: requirements
-    value: "http://solar.system/id-{{AREA}}/requirements/{{ID}}"
-  - scope: system
-    name: jenkins
-    value: "https://jenkins.corp/job/payments"
-```
-
-Each entry has exactly the strings `scope` (`version` or `system`), `name` and `value`; a
-missing field, another type or another scope is a configuration error naming the entry, and
-an extra key is an unknown field. The service checks the limits (20 per scope, names of at
-most 40 letters, digits, `-` and `_`, values of at most 2048 characters) and answers `400`
-naming the entry.
-
-A placeholder `{{NAME}}` (letters, digits and `_` only; `{{ A }}` or `{{a-b}}` is literal text)
-takes its value from the build: [`fill_annotations`] uses the last `--set NAME=value` pair
-for NAME, else the environment variable `SANSHAIN_SET_NAME`. An empty value counts as unset.
-An entry with an unfilled placeholder is left out, and [`FilledAnnotations::warnings`] names
-it, e.g. `annotation 'requirements' left out: {{ID}} is not set (--set ID=… or SANSHAIN_SET_ID)`;
-the other entries are kept.
-
-```rust,no_run
-# use sanshain::{Client, Config, fill_annotations};
-# let config = Config::from_yaml_str("serviceName: s\n")?;
-let sets = [("ID".to_string(), "42".to_string())];
-let filled = fill_annotations(&config.annotations, &sets);
-for warning in &filled.warnings {
-    eprintln!("warning: {warning}");
-}
-let client = Client::from_config(&config)?.with_annotations(filled.annotations);
-# Ok::<(), sanshain::Error>(())
-```
-
-[`Client::with_annotations`] sends them: a provide carries every entry, a require (as the
-`annotations` query parameter), a bundle and a catalog push only the `system` ones, and a
-retire none. Annotations need **Sanshain Service 2.13.0 or later**. An older service refuses
-the field; the client then repeats the call once without it, sends no more annotations, and
-prints [`ANNOTATIONS_DROPPED_WARNING`] once — so upgrading the client first never
-fails a build.
-
-## Warnings
-
-The dependency graph is informational and never fails a build. Where Sanshain does not
-record a call in a graph — an unknown sanshain-branch, a `catalog-info.yaml` it cannot read —
-the call still succeeds, and the response carries a `Sanshain-Warning` header, one line per
-warning. [`Client::take_warnings`] hands over every warning received since its last call (from
-any call, success or failure); printing them, and failing under strict mode, is up to the
-caller. `cargo sanshain` prints each as `warning: <text>` and, under strict mode, fails with
-`strict: Sanshain warned: <text>`.
-
-## Retiring
-
-Deleting a `provides` entry says nothing — Sanshain cannot distinguish a dropped protocol
-from a pipeline that stopped running. Keep the entry, mark it `retired: true`, and call
-[`Client::retire`]: the capability tag is cleared, the family leaves the current graph and
-its AsyncAPI channel contracts are released. Version history and existing Consumer pins are
-untouched.
-
-Retiring needs the `releaser` role — which a release pipeline already holds — or a
-maintainer grant on that Producer.
-
-## AsyncAPI as OpenAPI (`format`)
-
-A `requires` entry with `apiType: asyncapi` may add `format: openapi`: Sanshain then answers
-the pinned channels as an OpenAPI document of their message schemas, for OpenAPI code
-generators. It is written under the same file name as without `format`. `openapi` is the only
-value and AsyncAPI the only API type it combines with; anything else fails before any request.
-To get both formats, list the entry twice with different `outputDirectory`s:
-
-```yaml
-requires:
-  - serviceName: user-events
-    apiType: asyncapi
-    version: 1.4.0
-    outputDirectory: generated/user-events/asyncapi
-    endpoints:
-      - method: SUB
-        path: user/signup
-  - serviceName: user-events
-    apiType: asyncapi
-    format: openapi
-    version: 1.4.0
-    outputDirectory: generated/user-events/openapi
-    endpoints:
-      - method: SUB
-        path: user/signup
-```
-
-`format` needs **Sanshain Service 2.4.0 or later**. An older service ignores it and answers
-AsyncAPI; the client notices, writes nothing, and fails with
-`format: openapi needs Sanshain Service 2.4.0 or later (server is <version>)` (a warning
-under best effort).
-
-An older service rejects the single-endpoint request or returns AsyncAPI; the client reports
-that it needs 2.4.0.
-
-## Catalog
-
-`catalogInfo` names the project's Backstage `catalog-info.yaml`. [`Client::catalog`] pushes it
-with `PUT /catalog/<serviceName>`, so the network graph shows the peripheral resources
-(databases, buckets, queues) the system depends on. Sanshain reads only the `Component` whose
-`metadata.name` equals `serviceName`, and of it only `spec.dependsOn`; each push replaces the
-previous set. A trunk stream sends `trunk: true` and updates the main graph as well as the
-dev graph; any other stream updates only the dev graph. The returned [`CatalogResponse`]
-lists the recorded resources. A file Sanshain cannot read as this project's Component (invalid
-YAML, no Component named `serviceName`, a malformed `dependsOn`) records nothing — the previous
-periphery stays — and answers with [`CatalogResponse::recorded`] `false` and a warning naming
-the reason.
-
-This needs **Sanshain Service 2.4.0 or later**; every other call works with any 2.x service.
-
-## AsyncAPI 2.x perspective
-
-Sanshain reads 2.x `publish`/`subscribe` from the **application's** perspective: `publish`
-means *this service publishes*, `subscribe` means *this service consumes*. The AsyncAPI 2.x
-specification defines them from the **client's** perspective — exactly inverted. Sanshain
-uses the application reading deliberately, matching the unambiguous 3.x `send`/`receive`
-mapping. A document authored the spec-literal way registers its contracts, and has its
-subscriptions harvested, backwards.
-
-Harvested subscriptions come back on the provide response as
-[`ProvideResponse::harvested_subscriptions`]; those where
-[`HarvestedSubscription::is_advisory`] holds deserve a build warning.
-
-## Failure modes
-
-- **403** — the caller lacks `releaser` (GA provide) or `releaser`/maintainer (retire).
-- **404** — the producer or the pinned version does not exist. Fix the pin.
-- **409** — the version rules refused the provide; the message carries `proposed_version`.
-  The fix is always a version bump in your own spec file; the client never edits it.
-- **410** — the pinned version exists but deliberately lacks the requested endpoints.
-- **404 on a catalog push** — the service is older than 2.4.0; the message names its version.
-- **Pre-2.0 server** — after a failure the client makes one lazy `GET /version` and reports
-  an old instance as such.
+`Client::from_config` reads `SANSHAIN_URL` and `SANSHAIN_TOKEN` from the environment.
 
 ## Licence
 
-Apache-2.0.
+Apache-2.0. See [LICENSE](https://github.com/paxel/sanshain-rs/blob/summer/LICENSE).
