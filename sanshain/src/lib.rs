@@ -1413,9 +1413,11 @@ impl Config {
 }
 
 /// Resolves the server base URL: the `SANSHAIN_URL` environment variable wins
-/// over the configured `sanshainUrl`; missing both is a configuration error.
+/// over the configured `sanshainUrl`, unless it is empty (an empty variable
+/// counts as unset); missing both is a configuration error.
 pub fn resolve_url(config_url: Option<&str>, env_url: Option<&str>) -> Result<String> {
     env_url
+        .filter(|u| !u.trim().is_empty())
         .or(config_url)
         .map(|u| u.trim_end_matches('/').to_string())
         .filter(|u| !u.is_empty())
@@ -3376,6 +3378,22 @@ requires:
                 assert!(message.contains("SANSHAIN_URL"), "unexpected: {message}");
             }
             other => panic!("expected a configuration error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_empty_url_variable_counts_as_unset() {
+        for empty in ["", "  "] {
+            match resolve_url(Some("http://config.example/"), Some(empty)) {
+                Ok(url) => assert_eq!(url, "http://config.example"),
+                Err(err) => panic!("expected the configured URL, got {err}"),
+            }
+            match resolve_url(None, Some(empty)) {
+                Err(Error::Config(message)) => {
+                    assert!(message.contains("'sanshainUrl'"), "unexpected: {message}");
+                }
+                other => panic!("expected a configuration error, got {other:?}"),
+            }
         }
     }
 
