@@ -17,7 +17,7 @@ Rust client for the [Sanshain Service](https://github.com/paxel/sanshain-service
 producer-declared version; a **Consumer** requires only the endpoint snippets it needs,
 pinned to an exact version.
 
-**Compatibility: 3.x speaks Sanshain Service 2.x.**
+**Compatibility: 4.x speaks Sanshain Service 2.x.**
 
 | Crate                                | What it is                                              |
 |--------------------------------------|---------------------------------------------------------|
