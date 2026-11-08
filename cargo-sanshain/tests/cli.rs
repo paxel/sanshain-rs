@@ -1000,3 +1000,119 @@ fn an_unrecorded_catalog_warns_and_passes_unless_strict() {
     );
     drop(joined_requests(handle));
 }
+
+// --- autoGa: GA on every trunk or tag build ---
+
+/// A project providing `specs/openapi.yaml` to `url`, with `extra_yaml` on top.
+fn auto_ga_project(name: &str, url: &str, extra_yaml: &str) -> PathBuf {
+    let dir = project(name);
+    write_spec(&dir);
+    write(
+        &dir.join("sanshain.yaml"),
+        &format!(
+            "serviceName: demo-service\nsanshainUrl: {url}\n{extra_yaml}provides:\n  - file: specs/openapi.yaml\n"
+        ),
+    );
+    dir
+}
+
+/// The `stability` the one provide of a run sent.
+fn sent_stability(handle: JoinHandle<Vec<String>>) -> String {
+    let requests = joined_requests(handle);
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    let body = requests[0].split("\r\n\r\n").nth(1).unwrap_or("");
+    let Some((_, rest)) = body.split_once(r#""stability":""#) else {
+        panic!("provide sent no stability: {body}");
+    };
+    rest.split('"').next().unwrap_or("").to_string()
+}
+
+/// Test name, extra `sanshain.yaml`, extra arguments, environment, stability.
+type AutoGaCase = (
+    &'static str,
+    &'static str,
+    &'static [&'static str],
+    &'static [(&'static str, &'static str)],
+    &'static str,
+);
+
+/// The autoGa table every Sanshain client tests. `--ga` is presence-only, so
+/// the row with an explicit `false` flag is covered by the library's tests.
+#[test]
+fn auto_ga_decides_only_when_no_switch_is_set() {
+    let cases: [AutoGaCase; 7] = [
+        ("auto_ga_trunk", "autoGa: true\n", &["--trunk"], &[], "ga"),
+        (
+            "auto_ga_tag",
+            "autoGa: true\n",
+            &[],
+            &[("SANSHAIN_TAG", "release-1")],
+            "ga",
+        ),
+        ("auto_ga_no_stream", "autoGa: true\n", &[], &[], "snapshot"),
+        (
+            "auto_ga_env_false",
+            "autoGa: true\n",
+            &["--trunk"],
+            &[("SANSHAIN_GA", "false")],
+            "snapshot",
+        ),
+        (
+            "auto_ga_off",
+            "autoGa: false\n",
+            &["--trunk"],
+            &[],
+            "snapshot",
+        ),
+        (
+            "auto_ga_absent_env_true",
+            "",
+            &[],
+            &[("SANSHAIN_GA", "true")],
+            "ga",
+        ),
+        (
+            "auto_ga_flag_beats_env",
+            "autoGa: true\n",
+            &["--ga"],
+            &[("SANSHAIN_GA", "false")],
+            "ga",
+        ),
+    ];
+    for (name, extra, args, envs, expected) in cases {
+        let (url, handle) = mock_server(vec![stored_response()]);
+        let dir = auto_ga_project(name, &url, extra);
+        let mut all_args = vec!["provide"];
+        all_args.extend_from_slice(args);
+        let output = run(&dir, &all_args, envs);
+        assert_success(&output);
+        assert!(
+            stdout(&output).contains(&format!("({expected})...")),
+            "{name}: {}",
+            stdout(&output)
+        );
+        assert_eq!(sent_stability(handle), expected, "{name}");
+    }
+}
+
+#[test]
+fn a_retire_under_auto_ga_on_trunk_sends_no_stability() {
+    let (url, handle) = mock_server(vec![http_response(
+        "200 OK",
+        r#"{"tag_cleared":"messaging","trunk_pins_closed":1,"contracts_released":0}"#,
+    )]);
+    let dir = project("auto_ga_retire");
+    write(
+        &dir.join("sanshain.yaml"),
+        &format!(
+            "serviceName: demo-service\nsanshainUrl: {url}\nautoGa: true\nprovides:\n  - file: specs/events.yaml\n    apiType: asyncapi\n    retired: true\n"
+        ),
+    );
+    let output = run(&dir, &["provide", "--trunk"], &[]);
+    assert_success(&output);
+    let requests = joined_requests(handle);
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert!(requests[0].starts_with("POST /provide/asyncapi "));
+    let body = requests[0].split("\r\n\r\n").nth(1).unwrap_or("");
+    assert_eq!(body, r#"{"producername":"demo-service","retired":true}"#);
+}

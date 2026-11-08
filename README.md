@@ -38,6 +38,7 @@ $ cargo install cargo-sanshain
 serviceName: gateway-service
 sanshainUrl: http://localhost:3000   # better: set SANSHAIN_URL in the environment
 catalogInfo: catalog-info.yaml       # optional: Backstage file for `cargo sanshain catalog`
+autoGa: true                         # optional: every trunk or tag build provides GA
 
 provides:
   - file: specs/openapi.yaml         # version read from info.version
@@ -60,6 +61,7 @@ requires:
 ```console
 $ cargo sanshain provide          # snapshot (the default)
 $ cargo sanshain provide --ga     # immutable GA release
+$ cargo sanshain provide --trunk  # GA as well with autoGa: true, else a snapshot
 $ cargo sanshain require          # download the pinned snippets
 $ cargo sanshain catalog          # push catalog-info.yaml (needs Sanshain Service 2.4.0+)
 ```

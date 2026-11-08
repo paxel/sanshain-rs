@@ -21,8 +21,8 @@
 use anyhow::bail;
 use clap::{Parser, Subcommand};
 use sanshain::{
-    BEST_EFFORT_ENV_VAR, CONFIG_FILE, Client, Config, Origin, OriginFlags, STRICT_ENV_VAR, Stream,
-    puzzled_cat, resolve_stability, resolve_switch_with,
+    BEST_EFFORT_ENV_VAR, CONFIG_FILE, Client, Config, Origin, OriginFlags, STRICT_ENV_VAR,
+    Stability, Stream, puzzled_cat, resolve_switch_with,
 };
 
 #[derive(Parser)]
@@ -50,9 +50,11 @@ struct SanshainArgs {
 #[derive(Subcommand)]
 enum Commands {
     /// Publish the configured spec(s) under the version declared in each spec
-    /// file; snapshot stability unless switched to GA
+    /// file; snapshot stability unless switched to GA (or autoGa on a trunk or
+    /// tag build)
     Provide {
-        /// Publish as immutable GA (same switch as SANSHAIN_GA=true)
+        /// Publish as immutable GA (same switch as SANSHAIN_GA=true; beats
+        /// SANSHAIN_GA and autoGa)
         #[arg(long)]
         ga: bool,
         #[command(flatten)]
@@ -123,6 +125,12 @@ impl StreamArgs {
     /// Both trunk and a tag is no error: the build is recorded in neither,
     /// with a warning — and under strict, a failure before any request.
     fn resolve(&self, mode: &Mode) -> anyhow::Result<Stream> {
+        Ok(self.resolve_declared(mode)?.0)
+    }
+
+    /// [`StreamArgs::resolve`], plus whether the build declared a stream at
+    /// all: trunk, a tag, or both (which sends neither) — what `autoGa` asks.
+    fn resolve_declared(&self, mode: &Mode) -> anyhow::Result<(Stream, bool)> {
         let (stream, warning) = Stream::resolve(self.trunk, self.tag.as_deref());
         if let Some(warning) = warning {
             eprintln!("warning: {warning}");
@@ -130,7 +138,8 @@ impl StreamArgs {
                 return Err(StrictFailure(format!("strict: {warning}")).into());
             }
         }
-        Ok(stream)
+        let declared = stream != Stream::None || warning.is_some();
+        Ok((stream, declared))
     }
 }
 
@@ -297,10 +306,12 @@ fn provide_all(
     stream: &StreamArgs,
     origin: &OriginArgs,
 ) -> anyhow::Result<bool> {
+    // The stream first: autoGa makes a provide GA on a build that declares one.
+    let (stream, declared) = stream.resolve_declared(mode)?;
+    let stability = Stability::resolve(ga.then_some(true), config.auto_ga, declared);
     let client = Client::from_config(config)?
-        .with_stream(stream.resolve(mode)?)
+        .with_stream(stream)
         .with_origin(origin.resolve());
-    let stability = resolve_stability(ga);
     let mut provided = false;
     for entry in &config.provides {
         if entry.retired {

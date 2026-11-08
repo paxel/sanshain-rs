@@ -119,7 +119,7 @@ that it needs 2.4.0.
 
 | Flag       | Environment        | Effect                                                          |
 |------------|--------------------|-----------------------------------------------------------------|
-| `--ga`     | `SANSHAIN_GA`      | Publish as immutable GA instead of a snapshot.                  |
+| `--ga`     | `SANSHAIN_GA`      | Publish as immutable GA instead of a snapshot; `SANSHAIN_GA=false` keeps a build a snapshot despite `autoGa`. |
 | `--trunk`  | `SANSHAIN_TRUNK`   | This build is trunk's: it maintains the main graph.             |
 | `--tag=<branch>` | `SANSHAIN_TAG` | This build belongs to a sanshain-branch (release or hotfix).  |
 | —          | `SANSHAIN_URL`     | Server base URL; overrides `sanshainUrl` from `sanshain.yaml`.  |
@@ -136,7 +136,7 @@ with surrounding whitespace ignored; any other value leaves it off.
 
 Stability and stream are declared by the pipeline, never committed to `sanshain.yaml` — the
 same checkout is built by trunk CI and on a developer's laptop, and only the pipeline knows
-which of them speaks for trunk. Declaring both `--trunk` and `--tag` records the build in
+which of them speaks for trunk. The one rule `sanshain.yaml` may state is `autoGa` (below). Declaring both `--trunk` and `--tag` records the build in
 neither graph: it prints
 `warning: trunk and tag are mutually exclusive - this build is recorded in neither` and sends
 neither (fails before any request under strict).
@@ -198,6 +198,28 @@ the call, with `strict: Sanshain warned: <text>` — best effort does not soften
 A set environment variable overrides the `sanshain.yaml` value either way
 (`SANSHAIN_STRICT=false` turns off `strict: true`); `--best-effort` always turns best effort on.
 
+### autoGa: GA on every trunk or tag build
+
+```yaml
+autoGa: true
+```
+
+With `autoGa: true` a provide is GA whenever the build declares a stream: trunk (`--trunk` /
+`SANSHAIN_TRUNK`) or a tag (`--tag` / `SANSHAIN_TAG`), also when it declares both. Without a
+stream it stays a snapshot, so a developer's laptop never releases. The first of these that is
+set decides:
+
+1. `--ga`;
+2. `SANSHAIN_GA` (an explicit `false` counts; empty or absent does not);
+3. `autoGa: true` with trunk or a tag;
+4. `snapshot`.
+
+There is still no branch detection: CI declares trunk and tag on its protected pipelines only,
+and that is what makes them GA. The CI token's user needs the `releaser` role, and a trunk
+build that changes the spec without a version bump fails with `409 immutable_ga` and the
+proposed version: bump the version in the spec file and build again. A retire never carries a
+stability, `autoGa` or not.
+
 ## In CI
 
 ```yaml
@@ -209,6 +231,9 @@ A set environment variable overrides the `sanshain.yaml` value either way
 # release-branch hotfix
 - run: cargo sanshain provide --tag "Release-Maribou" --ga
 ```
+
+With `autoGa: true` in `sanshain.yaml` the `--ga` can go: `--trunk` and `--tag` make those
+provides GA by themselves.
 
 Publishing GA requires the `releaser` role; without it the server answers `403` and the
 error names the role. Re-providing byte-identical content is a no-op, so unconditional

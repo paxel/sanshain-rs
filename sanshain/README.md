@@ -60,6 +60,7 @@ requires:
 - Relative paths (`file`, `outputDirectory`, `catalogInfo`) resolve against the directory containing
   `sanshain.yaml` when it is loaded with [`Config::from_yaml_file`], never against the working
   directory. Absolute paths stay absolute.
+- `autoGa: true` is read into [`Config::auto_ga`]; see [Stability](#stability).
 - `strict: true` and `bestEffort: true` are read into [`Config::strict`] and
   [`Config::best_effort`] for the command to act on; `SANSHAIN_STRICT` /
   `SANSHAIN_BEST_EFFORT`, when set, override them ([`resolve_switch_with`]). A missing
@@ -78,10 +79,39 @@ so a caller holding configuration in another form can bypass the file entirely.
 
 ## Stability
 
-Every provide declares one, and the default is always `snapshot`. GA is an explicit switch
-— `Stability::Ga`, or `SANSHAIN_GA=true` via [`resolve_stability`]. There is no git or
-branch detection. Snapshots are overwritable and expire when unused; GA versions are
-immutable and permanently claim their number.
+Every provide declares one, and the default is always `snapshot`. GA is an explicit act
+— `Stability::Ga`, `SANSHAIN_GA=true`, or `autoGa: true` in `sanshain.yaml` on a build
+that declares a stream. There is no git or branch detection. Snapshots are overwritable and
+expire when unused; GA versions are immutable and permanently claim their number.
+
+[`Stability::resolve`] decides it; the first of these that is set wins:
+
+1. the GA flag, `Some(true)` or `Some(false)`;
+2. `SANSHAIN_GA`, unless absent or blank (an explicit `false` counts);
+3. `autoGa: true` ([`Config::auto_ga`]) on a build that declares trunk or a tag, or both;
+4. `snapshot`.
+
+```rust,no_run
+# use sanshain::{Config, Stability, Stream};
+# let config = Config::from_yaml_str("serviceName: s\nautoGa: true\n")?;
+// The stream first: autoGa asks whether the build declared one.
+let (stream, warning) = Stream::resolve(false, None);
+let declared = stream != Stream::None || warning.is_some();
+let stability = Stability::resolve(None, config.auto_ga, declared);
+# Ok::<(), sanshain::Error>(())
+```
+
+```yaml
+autoGa: true   # every trunk or tag build provides GA
+```
+
+With `autoGa: true`, CI declaring trunk (`SANSHAIN_TRUNK`) or a tag (`SANSHAIN_TAG`) is
+what makes a provide GA: CI declares them on its protected pipelines only, and a build
+without a stream — a developer's laptop — stays a snapshot. `SANSHAIN_GA=false` keeps one
+build a snapshot anyway. The CI token's user needs the `releaser` role, and a trunk build
+that changes the spec without a version bump fails with `409 immutable_ga` and the proposed
+version: bump the version in the spec file and build again. A retire never carries a
+stability, `autoGa` or not. [`resolve_stability`] predates `autoGa` and ignores it.
 
 Publishing GA requires the `releaser` role. Without it the server answers `403`, and the
 error names the role and the snapshot fallback.

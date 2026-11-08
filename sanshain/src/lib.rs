@@ -11,7 +11,9 @@
 //! The spec version is never configured here — it lives in the spec file itself
 //! (`info.version` for OpenAPI/AsyncAPI, a `// sanshain-version:` comment for
 //! proto). Every provide declares a stability: `snapshot` by default, `ga` only
-//! via the explicit switch (`SANSHAIN_GA=true` or the CLI's `--ga`).
+//! via the explicit switch (`SANSHAIN_GA=true` or the CLI's `--ga`), or with
+//! `autoGa: true` on a build that declares trunk or a tag (see
+//! [`Stability::resolve`]).
 
 // Shipped code may not use `unsafe` and may not panic: no unwrap, expect or
 // panic or unreachable, no indexing or slicing that can go out of bounds, no
@@ -145,17 +147,58 @@ pub fn resolve_switch_with(flag: bool, env: Option<&str>, configured: bool) -> b
 }
 
 /// Resolves the stability of a provide: the explicit `--ga` flag or
-/// `SANSHAIN_GA=true` switch to GA; everything else is a snapshot.
+/// `SANSHAIN_GA=true` switch to GA; everything else is a snapshot. Knows
+/// nothing of `autoGa`; see [`Stability::resolve`] for the full rule.
 pub fn resolve_stability(ga_flag: bool) -> Stability {
     resolve_stability_with(ga_flag, std::env::var(GA_ENV_VAR).ok().as_deref())
 }
 
 /// [`resolve_stability`] with the environment value passed in (testable).
 pub fn resolve_stability_with(ga_flag: bool, ga_env: Option<&str>) -> Stability {
-    if ga_flag || is_switch_on(ga_env) {
-        Stability::Ga
-    } else {
-        Stability::Snapshot
+    Stability::resolve_with(ga_flag.then_some(true), ga_env, false, false)
+}
+
+impl Stability {
+    /// The stability of a provide; the first of these that is set decides:
+    ///
+    /// 1. the explicit GA flag, `true` or `false` (`None` when not given);
+    /// 2. [`GA_ENV_VAR`] when it is not blank, read like every switch
+    ///    ([`is_switch_on`]), so an explicit `false` counts;
+    /// 3. `autoGa: true` ([`Config::auto_ga`]) on a build that declares a
+    ///    stream — trunk, a tag, or both;
+    /// 4. otherwise [`Stability::Snapshot`].
+    ///
+    /// There is no branch detection: the pipeline declares the stream (see
+    /// [`Stream`]), so only its protected trunk and release builds become GA.
+    /// Resolve the stream first; a build declaring both trunk and a tag
+    /// resolves to [`Stream::None`] with a warning but still declared one.
+    pub fn resolve(ga_flag: Option<bool>, auto_ga: bool, stream_declared: bool) -> Stability {
+        Stability::resolve_with(
+            ga_flag,
+            std::env::var(GA_ENV_VAR).ok().as_deref(),
+            auto_ga,
+            stream_declared,
+        )
+    }
+
+    /// [`Stability::resolve`] with the environment value passed in (testable).
+    pub fn resolve_with(
+        ga_flag: Option<bool>,
+        ga_env: Option<&str>,
+        auto_ga: bool,
+        stream_declared: bool,
+    ) -> Stability {
+        let env = ga_env.filter(|value| !value.trim().is_empty());
+        let ga = match (ga_flag, env) {
+            (Some(flag), _) => flag,
+            (None, Some(value)) => is_switch_on(Some(value)),
+            (None, None) => auto_ga && stream_declared,
+        };
+        if ga {
+            Stability::Ga
+        } else {
+            Stability::Snapshot
+        }
     }
 }
 
@@ -569,6 +612,10 @@ pub struct Config {
     /// `catalogInfo`: the project's Backstage `catalog-info.yaml`, pushed by
     /// [`Client::catalog`].
     pub catalog_info: Option<PathBuf>,
+    /// `autoGa` from `sanshain.yaml`: a provide is GA whenever the build
+    /// declares trunk or a tag, unless the GA switch says otherwise. See
+    /// [`Stability::resolve`].
+    pub auto_ga: bool,
     /// Fields no Sanshain client knows, as paths in file order
     /// (`provides[1].verison`). Parsing ignores them; see [`puzzled_cat`].
     pub unknown_fields: Vec<String>,
@@ -589,6 +636,8 @@ struct RawConfig {
     #[serde(default)]
     best_effort: bool,
     catalog_info: Option<PathBuf>,
+    #[serde(default)]
+    auto_ga: bool,
 }
 
 /// Config fields removed in the 2.0 model, rejected by name with a migration hint.
@@ -648,6 +697,7 @@ const KNOWN_TOP_FIELDS: &[&str] = &[
     "insecure",
     "combine",
     "catalogInfo",
+    "autoGa",
     "provide",
     "provides",
     "requires",
@@ -1067,6 +1117,7 @@ fn validate(value: &Value, unknown_fields: Vec<String>) -> Result<Config> {
         strict: raw.strict,
         best_effort: raw.best_effort,
         catalog_info: raw.catalog_info,
+        auto_ga: raw.auto_ga,
         unknown_fields,
     })
 }
@@ -1436,7 +1487,7 @@ pub(crate) fn provide_error_message(
         // remedy is a role grant — nothing the Producer can change in its own
         // repository. Naming it is the whole value of catching this status.
         403 => format!(
-            "provide refused (403): {server_message}\nPublishing a GA version requires the 'releaser' role. Grant it to the user or token this build authenticates as (administrators and root always hold it), or publish as a snapshot by leaving --ga / {GA_ENV_VAR} unset."
+            "provide refused (403): {server_message}\nPublishing a GA version requires the 'releaser' role. Grant it to the user or token this build authenticates as (administrators and root always hold it), or publish as a snapshot by leaving --ga / {GA_ENV_VAR} unset and autoGa off (or setting {GA_ENV_VAR}=false)."
         ),
         _ => format!("provide failed ({status}): {server_message}"),
     }
@@ -2297,6 +2348,7 @@ force: true
 insecure: true
 combine: true
 catalogInfo: catalog-info.yaml
+autoGa: true
 provide:
   file: a.yaml
   apiType: openapi
@@ -2581,6 +2633,78 @@ requires:
         assert_eq!(resolve_stability_with(true, None), Stability::Ga);
         // The explicit flag wins even when the environment says otherwise.
         assert_eq!(resolve_stability_with(true, Some("false")), Stability::Ga);
+    }
+
+    /// The autoGa table every Sanshain client tests: (autoGa, stream declared,
+    /// GA flag, SANSHAIN_GA) and the stability it resolves to.
+    #[test]
+    fn auto_ga_makes_a_declared_stream_ga_unless_the_switch_is_set() {
+        let (trunk, tag, none) = (
+            Stream::resolve_with(true, None, None, None),
+            Stream::resolve_with(false, Some("release-1"), None, None),
+            Stream::resolve_with(false, None, None, None),
+        );
+        let declared = |(stream, warning): &(Stream, Option<&str>)| {
+            *stream != Stream::None || warning.is_some()
+        };
+        let both = Stream::resolve_with(true, Some("release-1"), None, None);
+        assert_eq!(both.0, Stream::None);
+        let cases = [
+            // autoGa, stream, ga flag, SANSHAIN_GA, expected
+            (true, &trunk, None, None, Stability::Ga),
+            (true, &tag, None, None, Stability::Ga),
+            (true, &none, None, None, Stability::Snapshot),
+            (true, &trunk, None, Some("false"), Stability::Snapshot),
+            (true, &trunk, Some(false), None, Stability::Snapshot),
+            (false, &trunk, None, None, Stability::Snapshot),
+            (false, &none, None, Some("true"), Stability::Ga),
+            (true, &none, Some(true), Some("false"), Stability::Ga),
+            // Both trunk and a tag send neither, but still declared a stream.
+            (true, &both, None, None, Stability::Ga),
+        ];
+        for (auto_ga, stream, flag, env, expected) in cases {
+            assert_eq!(
+                Stability::resolve_with(flag, env, auto_ga, declared(stream)),
+                expected,
+                "autoGa {auto_ga}, stream {:?}, flag {flag:?}, SANSHAIN_GA {env:?}",
+                stream.0
+            );
+        }
+    }
+
+    #[test]
+    fn a_blank_ga_variable_is_unset_and_any_other_value_decides() {
+        for blank in ["", " ", "\n"] {
+            assert_eq!(
+                Stability::resolve_with(None, Some(blank), true, true),
+                Stability::Ga,
+                "{blank:?}"
+            );
+        }
+        for off in ["no", "0", "FALSE"] {
+            assert_eq!(
+                Stability::resolve_with(None, Some(off), true, true),
+                Stability::Snapshot,
+                "{off:?}"
+            );
+        }
+        assert_eq!(
+            Stability::resolve_with(None, Some(" 1 "), false, false),
+            Stability::Ga
+        );
+    }
+
+    #[test]
+    fn auto_ga_defaults_off_and_loads_from_yaml() {
+        let plain = Config::from_yaml_str("serviceName: s\n").ok();
+        assert_eq!(plain.map(|c| c.auto_ga), Some(false));
+        let on = Config::from_yaml_str("serviceName: s\nautoGa: true\n").ok();
+        assert_eq!(on.as_ref().map(|c| c.auto_ga), Some(true));
+        assert_eq!(on.map(|c| c.unknown_fields), Some(Vec::new()));
+        match Config::from_yaml_str("serviceName: s\nautoGa: yes\n") {
+            Err(Error::Config(message)) => assert!(message.contains("invalid"), "{message}"),
+            other => panic!("expected a configuration error, got {other:?}"),
+        }
     }
 
     #[test]
@@ -3057,6 +3181,11 @@ requires:
         );
         assert!(message.contains("releaser"), "unexpected: {message}");
         assert!(message.contains("snapshot"), "unexpected: {message}");
+        assert!(message.contains("autoGa off"), "unexpected: {message}");
+        assert!(
+            message.contains("SANSHAIN_GA=false"),
+            "unexpected: {message}"
+        );
     }
 
     #[test]
