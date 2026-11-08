@@ -3,8 +3,8 @@
 //! (409, 404, 410, pre-2.0 server) are surfaced.
 
 use sanshain::{
-    ApiType, Client, Config, Endpoint, Error, ProvideEntry, RequireEntry, RequireFormat, Stability,
-    Stream,
+    Annotation, AnnotationScope, ApiType, Client, Config, Endpoint, Error, Origin, ProvideEntry,
+    RequireEntry, RequireFormat, Stability, Stream,
 };
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -997,4 +997,435 @@ fn a_warning_on_a_failure_is_kept_too() {
     assert!(client.provide("svc", &entry, Stability::Ga).is_err());
     assert_eq!(client.take_warnings(), vec![NO_BRANCH]);
     drop(joined_requests(handle));
+}
+
+// --- annotations ---
+
+fn annotations() -> Vec<Annotation> {
+    vec![
+        Annotation {
+            scope: AnnotationScope::Version,
+            name: "requirements".to_string(),
+            value: "http://solar.system/id-7/requirements/42".to_string(),
+        },
+        Annotation {
+            scope: AnnotationScope::System,
+            name: "jenkins".to_string(),
+            value: "https://jenkins.corp/job/payments?a=1&b=2".to_string(),
+        },
+    ]
+}
+
+fn both_scopes_json() -> serde_json::Value {
+    serde_json::json!([
+        { "scope": "version", "name": "requirements", "value": "http://solar.system/id-7/requirements/42" },
+        { "scope": "system", "name": "jenkins", "value": "https://jenkins.corp/job/payments?a=1&b=2" }
+    ])
+}
+
+fn system_scope_json() -> serde_json::Value {
+    serde_json::json!([
+        { "scope": "system", "name": "jenkins", "value": "https://jenkins.corp/job/payments?a=1&b=2" }
+    ])
+}
+
+/// What a service before 2.13.0 answers a body carrying `annotations`.
+fn annotations_refused_422(expected_one_of: &str) -> String {
+    http_response(
+        "422 Unprocessable Entity",
+        "text/plain; charset=utf-8",
+        &format!(
+            "Failed to deserialize the JSON body into the target type: unknown field `annotations`, expected one of {expected_one_of} at line 1 column 120"
+        ),
+    )
+}
+
+const PROVIDE_FIELDS_2_12: &str = "`producername`, `openapi_yaml`, `stability`, `trunk`, `tag`, `retired`, `dry_run`, `build_url`, `change_url`, `tickets`, `note`";
+
+/// The query parameter `name` of a request line, percent-decoded.
+fn query_param(line: &str, name: &str) -> Option<String> {
+    let target = line.split(' ').nth(1)?;
+    let (_, query) = target.split_once('?')?;
+    query.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == name).then(|| percent_decode(value))
+    })
+}
+
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
+                match u8::from_str_radix(hex, 16) {
+                    Ok(byte) => out.push(byte),
+                    Err(err) => panic!("bad escape in {value}: {err}"),
+                }
+                i += 3;
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+fn single_require_entry(name: &str) -> RequireEntry {
+    require_entry(
+        name,
+        vec![Endpoint {
+            method: "GET".to_string(),
+            path: "/api/v1/users/{id}".to_string(),
+        }],
+    )
+}
+
+fn bundle_require_entry(name: &str) -> RequireEntry {
+    require_entry(
+        name,
+        vec![
+            Endpoint {
+                method: "GET".to_string(),
+                path: "/a".to_string(),
+            },
+            Endpoint {
+                method: "POST".to_string(),
+                path: "/b".to_string(),
+            },
+        ],
+    )
+}
+
+fn snippet() -> String {
+    http_response("200 OK", "application/yaml", "openapi: 3.0.3\n")
+}
+
+#[test]
+fn a_provide_sends_the_annotations_of_both_scopes() {
+    let (url, handle) = mock_server(vec![accepted_response()]);
+    let client = Client::new(url.as_str(), None).with_annotations(annotations());
+    let entry = spec_entry("annotations_provide", ApiType::OpenApi);
+    if let Err(err) = client.provide("demo-service", &entry, Stability::Snapshot) {
+        panic!("provide failed: {err}");
+    }
+    let requests = joined_requests(handle);
+    assert_eq!(json_body(&requests[0])["annotations"], both_scopes_json());
+}
+
+#[test]
+fn without_annotations_no_field_is_sent_on_any_call() {
+    let (url, handle) = mock_server(vec![
+        accepted_response(),
+        snippet(),
+        snippet(),
+        catalog_ok_response(false),
+    ]);
+    let client = Client::new(url.as_str(), None);
+    let entry = spec_entry("annotations_none", ApiType::OpenApi);
+    if let Err(err) = client.provide("demo-service", &entry, Stability::Snapshot) {
+        panic!("provide failed: {err}");
+    }
+    for entry in [
+        single_require_entry("annotations_none_single"),
+        bundle_require_entry("annotations_none_bundle"),
+    ] {
+        if let Err(err) = client.require("gateway-service", &entry) {
+            panic!("require failed: {err}");
+        }
+    }
+    if let Err(err) = client.catalog("orders-service", &catalog_file("annotations_none_cat")) {
+        panic!("catalog failed: {err}");
+    }
+    let requests = joined_requests(handle);
+    assert_eq!(requests.len(), 4);
+    for request in &requests {
+        assert!(!request.contains("annotations"), "{request}");
+    }
+}
+
+#[test]
+fn a_version_annotation_alone_travels_on_the_provide_only() {
+    let (url, handle) = mock_server(vec![snippet(), catalog_ok_response(false)]);
+    let version_only = vec![annotations()[0].clone()];
+    let client = Client::new(url.as_str(), None).with_annotations(version_only);
+    if let Err(err) = client.require("gateway-service", &single_require_entry("version_only")) {
+        panic!("require failed: {err}");
+    }
+    if let Err(err) = client.catalog("orders-service", &catalog_file("version_only_cat")) {
+        panic!("catalog failed: {err}");
+    }
+    let requests = joined_requests(handle);
+    for request in &requests {
+        assert!(!request.contains("annotations"), "{request}");
+    }
+}
+
+#[test]
+fn a_retire_sends_no_annotations() {
+    let (url, handle) = mock_server(vec![http_response(
+        "200 OK",
+        "application/json",
+        r#"{"tag_cleared":null,"trunk_pins_closed":0,"contracts_released":0}"#,
+    )]);
+    let client = Client::new(url.as_str(), None).with_annotations(annotations());
+    if let Err(err) = client.retire("demo-service", ApiType::OpenApi) {
+        panic!("retire failed: {err}");
+    }
+    let requests = joined_requests(handle);
+    assert_eq!(
+        body_of(&requests[0]),
+        r#"{"producername":"demo-service","retired":true}"#
+    );
+}
+
+#[test]
+fn a_require_sends_the_system_annotations_as_a_json_query_parameter() {
+    let (url, handle) = mock_server(vec![snippet()]);
+    let client = Client::new(url.as_str(), None).with_annotations(annotations());
+    if let Err(err) = client.require("gateway-service", &single_require_entry("ann_query")) {
+        panic!("require failed: {err}");
+    }
+    let requests = joined_requests(handle);
+    let line = request_line(&requests[0]);
+    assert!(line.starts_with("GET /require?"), "{line}");
+    // Encoded by the HTTP library: no raw JSON or `&` of the value in the URL.
+    assert!(!line.contains('"') && !line.contains('{'), "{line}");
+    let Some(sent) = query_param(line, "annotations") else {
+        panic!("no annotations parameter: {line}");
+    };
+    let sent: serde_json::Value = match serde_json::from_str(&sent) {
+        Ok(sent) => sent,
+        Err(err) => panic!("annotations parameter is not JSON: {err}: {sent}"),
+    };
+    assert_eq!(sent, system_scope_json());
+}
+
+#[test]
+fn a_bundle_sends_the_system_annotations_in_its_body() {
+    let (url, handle) = mock_server(vec![snippet()]);
+    let client = Client::new(url.as_str(), None).with_annotations(annotations());
+    if let Err(err) = client.require("gateway-service", &bundle_require_entry("ann_bundle")) {
+        panic!("require failed: {err}");
+    }
+    let requests = joined_requests(handle);
+    assert!(request_line(&requests[0]).starts_with("POST /require-bundle "));
+    assert!(!request_line(&requests[0]).contains("annotations"));
+    assert_eq!(json_body(&requests[0])["annotations"], system_scope_json());
+}
+
+#[test]
+fn a_catalog_push_sends_the_system_annotations_in_its_body() {
+    let (url, handle) = mock_server(vec![catalog_ok_response(true)]);
+    let client = Client::new(url.as_str(), None)
+        .with_stream(Stream::Trunk)
+        .with_annotations(annotations());
+    if let Err(err) = client.catalog("orders-service", &catalog_file("ann_catalog")) {
+        panic!("catalog failed: {err}");
+    }
+    let requests = joined_requests(handle);
+    let body = json_body(&requests[0]);
+    assert_eq!(body["annotations"], system_scope_json());
+    assert_eq!(body["trunk"], true);
+}
+
+fn origin() -> Origin {
+    Origin {
+        note: Some("Adds users".to_string()),
+        ..Origin::default()
+    }
+}
+
+#[test]
+fn a_provide_refused_for_its_annotations_is_repeated_without_them_keeping_the_origin() {
+    let (url, handle) = mock_server(vec![
+        annotations_refused_422(PROVIDE_FIELDS_2_12),
+        accepted_response(),
+        accepted_response(),
+    ]);
+    let client = Client::new(url.as_str(), None)
+        .with_origin(origin())
+        .with_annotations(annotations());
+    let entry = spec_entry("ann_refused", ApiType::OpenApi);
+    for _ in 0..2 {
+        if let Err(err) = client.provide("demo-service", &entry, Stability::Snapshot) {
+            panic!("provide failed: {err}");
+        }
+    }
+    let requests = joined_requests(handle);
+    assert_eq!(requests.len(), 3, "{requests:?}");
+    assert_eq!(json_body(&requests[0])["annotations"], both_scopes_json());
+    for retried in &requests[1..] {
+        let body = json_body(retried);
+        assert!(body.get("annotations").is_none(), "{body}");
+        // `build_url` in "expected one of" must not drop the origin too.
+        assert_eq!(body["note"], "Adds users");
+    }
+}
+
+#[test]
+fn a_2_8_service_gets_the_provide_without_both_in_either_order() {
+    let origin_refused = http_response(
+        "422 Unprocessable Entity",
+        "text/plain; charset=utf-8",
+        "Failed to deserialize the JSON body into the target type: unknown field `note`, expected one of `producername`, `openapi_yaml`, `stability`, `trunk`, `tag`, `retired`, `dry_run` at line 1 column 80",
+    );
+    let fields_2_8 =
+        "`producername`, `openapi_yaml`, `stability`, `trunk`, `tag`, `retired`, `dry_run`";
+    for (name, first, second) in [
+        (
+            "ann_then_origin",
+            annotations_refused_422(fields_2_8),
+            origin_refused.clone(),
+        ),
+        (
+            "origin_then_ann",
+            origin_refused.clone(),
+            annotations_refused_422(fields_2_8),
+        ),
+    ] {
+        let (url, handle) = mock_server(vec![first, second, accepted_response()]);
+        let client = Client::new(url.as_str(), None)
+            .with_origin(origin())
+            .with_annotations(annotations());
+        let entry = spec_entry(name, ApiType::OpenApi);
+        if let Err(err) = client.provide("demo-service", &entry, Stability::Snapshot) {
+            panic!("{name}: provide failed: {err}");
+        }
+        let requests = joined_requests(handle);
+        assert_eq!(requests.len(), 3, "{name}: {requests:?}");
+        let last = json_body(&requests[2]);
+        assert!(last.get("annotations").is_none(), "{name}: {last}");
+        assert!(last.get("note").is_none(), "{name}: {last}");
+        assert_eq!(last["stability"], "snapshot", "{name}");
+    }
+}
+
+#[test]
+fn a_422_naming_an_origin_field_only_as_expected_is_no_origin_refusal() {
+    let (url, handle) = mock_server(vec![
+        http_response(
+            "422 Unprocessable Entity",
+            "text/plain; charset=utf-8",
+            "Failed to deserialize the JSON body into the target type: unknown field `colour`, expected one of `producername`, `openapi_yaml`, `stability`, `build_url`, `change_url`, `tickets`, `note`, `annotations` at line 1 column 40",
+        ),
+        version_response("2.13.0"),
+    ]);
+    let client = Client::new(url.as_str(), None)
+        .with_origin(origin())
+        .with_annotations(annotations());
+    let entry = spec_entry("no_false_refusal", ApiType::OpenApi);
+    let message = match client.provide("demo-service", &entry, Stability::Snapshot) {
+        Err(err) => err.to_string(),
+        Ok(_) => panic!("expected the provide to fail"),
+    };
+    assert!(message.starts_with("provide rejected (422"), "{message}");
+    assert!(message.contains("unknown field `colour`"), "{message}");
+    let requests = joined_requests(handle);
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    assert!(request_line(&requests[1]).starts_with("GET /version "));
+}
+
+#[test]
+fn a_require_refused_for_its_annotations_is_repeated_without_them_before_the_format_check() {
+    let refused = http_response(
+        "400 Bad Request",
+        "text/plain; charset=utf-8",
+        "Failed to deserialize query string: unknown field `annotations`, expected one of `consumername`, `producername`, `version`, `path`, `method`, `trunk`, `tag`, `format`",
+    );
+    let (url, handle) = mock_server(vec![
+        refused,
+        http_response(
+            "200 OK",
+            "application/yaml",
+            "openapi: 3.0.3\ninfo:\n  title: events\n",
+        ),
+        http_response(
+            "200 OK",
+            "application/yaml",
+            "openapi: 3.0.3\ninfo:\n  title: events\n",
+        ),
+    ]);
+    let client = Client::new(url.as_str(), None).with_annotations(annotations());
+    let entry = asyncapi_as_openapi("ann_require_refused", 1);
+    for _ in 0..2 {
+        if let Err(err) = client.require("gateway-service", &entry) {
+            panic!("require failed: {err}");
+        }
+    }
+    let requests = joined_requests(handle);
+    assert_eq!(requests.len(), 3, "{requests:?}");
+    assert!(query_param(request_line(&requests[0]), "annotations").is_some());
+    for retried in &requests[1..] {
+        let line = request_line(retried);
+        assert!(line.starts_with("GET /require/asyncapi?"), "{line}");
+        assert!(query_param(line, "annotations").is_none(), "{line}");
+        assert!(line.contains("format=openapi"), "{line}");
+    }
+}
+
+#[test]
+fn a_bundle_refused_for_its_annotations_is_repeated_without_them() {
+    let (url, handle) = mock_server(vec![
+        annotations_refused_422(
+            "`consumername`, `producername`, `version`, `api_type`, `endpoints`, `trunk`, `tag`",
+        ),
+        snippet(),
+    ]);
+    let client = Client::new(url.as_str(), None).with_annotations(annotations());
+    if let Err(err) = client.require("gateway-service", &bundle_require_entry("ann_bundle_422")) {
+        panic!("require failed: {err}");
+    }
+    let requests = joined_requests(handle);
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    assert_eq!(json_body(&requests[0])["annotations"], system_scope_json());
+    assert!(json_body(&requests[1]).get("annotations").is_none());
+    assert_eq!(json_body(&requests[1])["version"], "1.2.0");
+}
+
+#[test]
+fn a_catalog_push_refused_for_its_annotations_is_repeated_without_them() {
+    let (url, handle) = mock_server(vec![
+        annotations_refused_422("`catalog_info_yaml`, `trunk`"),
+        catalog_ok_response(false),
+    ]);
+    let client = Client::new(url.as_str(), None).with_annotations(annotations());
+    match client.catalog("orders-service", &catalog_file("ann_catalog_422")) {
+        Ok(recorded) => assert_eq!(recorded.resources.len(), 2),
+        Err(err) => panic!("catalog failed: {err}"),
+    }
+    let requests = joined_requests(handle);
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    assert_eq!(json_body(&requests[0])["annotations"], system_scope_json());
+    assert!(json_body(&requests[1]).get("annotations").is_none());
+}
+
+#[test]
+fn another_400_on_an_annotated_require_is_reported_as_before() {
+    let (url, handle) = mock_server(vec![
+        http_response(
+            "400 Bad Request",
+            "text/plain; charset=utf-8",
+            "annotation 'jenkins': value must not be blank",
+        ),
+        version_response("2.13.0"),
+    ]);
+    let client = Client::new(url.as_str(), None).with_annotations(annotations());
+    let message = match client.require("gateway-service", &single_require_entry("ann_400")) {
+        Err(err) => err.to_string(),
+        Ok(_) => panic!("expected the require to fail"),
+    };
+    assert_eq!(
+        message,
+        "require failed (400): annotation 'jenkins': value must not be blank"
+    );
+    assert_eq!(joined_requests(handle).len(), 2);
 }

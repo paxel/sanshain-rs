@@ -130,6 +130,7 @@ that it needs 2.4.0.
 | `--change-url=<url>` | `SANSHAIN_CHANGE_URL` | The pull or merge request behind it; default: the runner's own variable. |
 | `--tickets=<ids>` | `SANSHAIN_TICKETS` | Ticket ids this build closes, comma-separated. |
 | `--note=<text>` | `SANSHAIN_NOTE` | One line of intent for this provide. |
+| `--set NAME=value` | `SANSHAIN_SET_NAME` | Fills the `{{NAME}}` placeholders of the `annotations`; repeatable. |
 
 A switch variable (`SANSHAIN_GA`, `SANSHAIN_TRUNK`, `SANSHAIN_STRICT`, `SANSHAIN_BEST_EFFORT`) is on for `true` or `1`, in any case and
 with surrounding whitespace ignored; any other value leaves it off.
@@ -163,6 +164,51 @@ and `.`, and a note of at most 200 characters.
 This client sends no `dry_run`. A pull-request pipeline that wants Sanshain to check the version
 rules without storing anything calls the route with `curl` and `"dry_run": true` (see
 [CI integration](https://paxel.github.io/sanshain-service/developer/ci-integration.html#dry-runs-for-pull-requests)).
+
+### Annotations
+
+`annotations` in `sanshain.yaml` are named values Sanshain shows with the provided version
+(`scope: version`) or with the system (`scope: system`), for example a link to the
+requirements a build implements and to the system's Jenkins job:
+
+```yaml
+annotations:
+  - scope: version
+    name: requirements
+    value: "http://solar.system/id-{{AREA}}/requirements/{{ID}}"
+  - scope: system
+    name: jenkins
+    value: "https://jenkins.corp/job/payments"
+```
+
+Each entry has exactly `scope` (`version` or `system`), `name` and `value`, all strings; a
+missing field, another type or another scope fails before any request, naming the entry. The
+service checks the limits (20 per scope, names of at most 40 letters, digits, `-` and `_`,
+values of at most 2048 characters) and answers `400` naming the entry.
+
+A placeholder `{{NAME}}` (letters, digits and `_` only; `{{ A }}` or `{{a-b}}` stays literal
+text) is filled by the build: `--set NAME=value` on `provide`, `require` and `catalog`
+(repeatable, split at the first `=`), else the environment variable `SANSHAIN_SET_NAME`. An
+empty value counts as unset — an empty `--set` does not fall back to the variable:
+
+```console
+$ cargo sanshain provide --set AREA=7 --set ID=42
+```
+
+An entry with an unfilled placeholder is left out with a warning, and the others are sent:
+
+```text
+warning: annotation 'requirements' left out: {{ID}} is not set (--set ID=… or SANSHAIN_SET_ID)
+```
+
+Under strict mode that warning fails the command before any request, also with best effort.
+
+`provide` sends every entry; `require`, its bundles and `catalog` send only the `system`
+ones; retiring sends none. **Annotations need Sanshain Service 2.13.0 or later.** An older
+service refuses them; the command then repeats the call without them, sends none for the rest
+of the run, and warns once:
+`warning: Sanshain Service before 2.13.0 does not take annotations; sending without them`
+(strict mode does not fail on this one).
 
 ## Strict mode and best effort
 

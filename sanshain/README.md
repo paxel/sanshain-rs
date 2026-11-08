@@ -61,6 +61,8 @@ requires:
   `sanshain.yaml` when it is loaded with [`Config::from_yaml_file`], never against the working
   directory. Absolute paths stay absolute.
 - `autoGa: true` is read into [`Config::auto_ga`]; see [Stability](#stability).
+- `annotations` is read into [`Config::annotations`], placeholders unfilled; see
+  [Annotations](#annotations).
 - `strict: true` and `bestEffort: true` are read into [`Config::strict`] and
   [`Config::best_effort`] for the command to act on; `SANSHAIN_STRICT` /
   `SANSHAIN_BEST_EFFORT`, when set, override them ([`resolve_switch_with`]). A missing
@@ -136,6 +138,53 @@ or `SANSHAIN_TRUNK` / `SANSHAIN_TAG` and never from `sanshain.yaml`. Trunk and a
 mutually exclusive, and [`Stream`] cannot represent both: declaring both resolves to
 [`Stream::None`] together with the warning
 `trunk and tag are mutually exclusive - this build is recorded in neither`.
+
+## Annotations
+
+`annotations` in `sanshain.yaml` are named values Sanshain shows with the provided version
+(`scope: version`) or with the system (`scope: system`):
+
+```yaml
+annotations:
+  - scope: version
+    name: requirements
+    value: "http://solar.system/id-{{AREA}}/requirements/{{ID}}"
+  - scope: system
+    name: jenkins
+    value: "https://jenkins.corp/job/payments"
+```
+
+Each entry has exactly the strings `scope` (`version` or `system`), `name` and `value`; a
+missing field, another type or another scope is a configuration error naming the entry, and
+an extra key is an unknown field. The service checks the limits (20 per scope, names of at
+most 40 letters, digits, `-` and `_`, values of at most 2048 characters) and answers `400`
+naming the entry.
+
+A placeholder `{{NAME}}` (letters, digits and `_` only; `{{ A }}` or `{{a-b}}` is literal text)
+takes its value from the build: [`fill_annotations`] uses the last `--set NAME=value` pair
+for NAME, else the environment variable `SANSHAIN_SET_NAME`. An empty value counts as unset.
+An entry with an unfilled placeholder is left out, and [`FilledAnnotations::warnings`] names
+it, e.g. `annotation 'requirements' left out: {{ID}} is not set (--set ID=… or SANSHAIN_SET_ID)`;
+the other entries are kept.
+
+```rust,no_run
+# use sanshain::{Client, Config, fill_annotations};
+# let config = Config::from_yaml_str("serviceName: s\n")?;
+let sets = [("ID".to_string(), "42".to_string())];
+let filled = fill_annotations(&config.annotations, &sets);
+for warning in &filled.warnings {
+    eprintln!("warning: {warning}");
+}
+let client = Client::from_config(&config)?.with_annotations(filled.annotations);
+# Ok::<(), sanshain::Error>(())
+```
+
+[`Client::with_annotations`] sends them: a provide carries every entry, a require (as the
+`annotations` query parameter), a bundle and a catalog push only the `system` ones, and a
+retire none. Annotations need **Sanshain Service 2.13.0 or later**. An older service refuses
+the field; the client then repeats the call once without it, sends no more annotations, and
+prints [`ANNOTATIONS_DROPPED_WARNING`] once — so upgrading the client first never
+fails a build.
 
 ## Warnings
 

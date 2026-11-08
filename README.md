@@ -40,6 +40,14 @@ sanshainUrl: http://localhost:3000   # better: set SANSHAIN_URL in the environme
 catalogInfo: catalog-info.yaml       # optional: Backstage file for `cargo sanshain catalog`
 autoGa: true                         # optional: every trunk or tag build provides GA
 
+annotations:                         # optional: shown with the version or the system (needs Sanshain Service 2.13.0+)
+  - scope: version
+    name: requirements
+    value: "http://solar.system/id-{{AREA}}/requirements/{{ID}}"   # --set ID=42 or SANSHAIN_SET_ID=42
+  - scope: system
+    name: jenkins
+    value: "https://jenkins.corp/job/payments"
+
 provides:
   - file: specs/openapi.yaml         # version read from info.version
   - file: specs/gateway.proto        # version from the // sanshain-version: marker
@@ -67,7 +75,8 @@ $ cargo sanshain catalog          # push catalog-info.yaml (needs Sanshain Servi
 ```
 
 Relative paths in `sanshain.yaml` resolve against the directory containing it. `catalog`
-needs Sanshain Service 2.4.0 or later; every other command works with any 2.x service.
+needs Sanshain Service 2.4.0 or later and annotations 2.13.0 or later (an older service gets
+the call without them); every other command works with any 2.x service.
 
 See the [library README](sanshain/README.md) for the configuration reference and the API,
 and the [subcommand README](cargo-sanshain/README.md) for the flags and CI recipes.

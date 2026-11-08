@@ -21,8 +21,8 @@
 use anyhow::bail;
 use clap::{Parser, Subcommand};
 use sanshain::{
-    BEST_EFFORT_ENV_VAR, CONFIG_FILE, Client, Config, Origin, OriginFlags, STRICT_ENV_VAR,
-    Stability, Stream, puzzled_cat, resolve_switch_with,
+    Annotation, BEST_EFFORT_ENV_VAR, CONFIG_FILE, Client, Config, Origin, OriginFlags,
+    STRICT_ENV_VAR, Stability, Stream, fill_annotations, puzzled_cat, resolve_switch_with,
 };
 
 #[derive(Parser)]
@@ -61,11 +61,15 @@ enum Commands {
         stream: StreamArgs,
         #[command(flatten)]
         origin: OriginArgs,
+        #[command(flatten)]
+        sets: SetArgs,
     },
     /// Download the pinned endpoint snippet(s) declared in sanshain.yaml
     Require {
         #[command(flatten)]
         stream: StreamArgs,
+        #[command(flatten)]
+        sets: SetArgs,
     },
     /// Push the Backstage catalog-info.yaml named by catalogInfo, so the graph
     /// shows the peripheral resources this system depends on (needs Sanshain
@@ -73,7 +77,42 @@ enum Commands {
     Catalog {
         #[command(flatten)]
         stream: StreamArgs,
+        #[command(flatten)]
+        sets: SetArgs,
     },
+}
+
+/// The values of the `{{NAME}}` placeholders in the annotations of
+/// sanshain.yaml (Sanshain Service 2.13.0 or later).
+#[derive(clap::Args)]
+struct SetArgs {
+    /// Fill the {{NAME}} placeholders of the annotations in sanshain.yaml;
+    /// repeatable (beats SANSHAIN_SET_NAME)
+    #[arg(long = "set", value_name = "NAME=value", value_parser = parse_set)]
+    set: Vec<(String, String)>,
+}
+
+/// `NAME=value`, split at the first `=`, so the value may hold more.
+fn parse_set(arg: &str) -> Result<(String, String), String> {
+    arg.split_once('=')
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .ok_or_else(|| format!("expected NAME=value, got '{arg}'"))
+}
+
+impl SetArgs {
+    /// The annotations with their placeholders filled. Every entry left out
+    /// is a warning; under strict the first fails the command before any
+    /// request, and best effort does not soften that.
+    fn resolve(&self, config: &Config, mode: &Mode) -> anyhow::Result<Vec<Annotation>> {
+        let filled = fill_annotations(&config.annotations, &self.set);
+        for warning in &filled.warnings {
+            eprintln!("warning: {warning}");
+        }
+        if let (true, Some(first)) = (mode.strict, filled.warnings.first()) {
+            return Err(StrictFailure(format!("strict: {first}")).into());
+        }
+        Ok(filled.annotations)
+    }
 }
 
 /// Why this build provides — stored with the version as its origin. The build
@@ -237,9 +276,14 @@ fn main() -> anyhow::Result<()> {
     };
 
     match args.command {
-        Commands::Provide { ga, stream, origin } => provide(&config, &mode, ga, &stream, &origin),
-        Commands::Require { stream } => require(&config, &mode, &stream),
-        Commands::Catalog { stream } => catalog(&config, &mode, &stream),
+        Commands::Provide {
+            ga,
+            stream,
+            origin,
+            sets,
+        } => provide(&config, &mode, ga, &stream, &origin, &sets),
+        Commands::Require { stream, sets } => require(&config, &mode, &stream, &sets),
+        Commands::Catalog { stream, sets } => catalog(&config, &mode, &stream, &sets),
     }
 }
 
@@ -276,6 +320,7 @@ fn provide(
     ga: bool,
     stream: &StreamArgs,
     origin: &OriginArgs,
+    sets: &SetArgs,
 ) -> anyhow::Result<()> {
     let Some(service_name) = config.service_name.as_deref() else {
         return skip(mode, "serviceName", "provide");
@@ -283,7 +328,7 @@ fn provide(
     if config.provides.is_empty() {
         return skip(mode, "provide/provides entries", "provide");
     }
-    match provide_all(config, service_name, mode, ga, stream, origin) {
+    match provide_all(config, service_name, mode, ga, stream, origin, sets) {
         Ok(true) => Ok(()),
         // Only reachable when best effort skipped every missing spec file.
         Ok(false) if mode.strict => bail!("No specification files found to provide."),
@@ -305,13 +350,16 @@ fn provide_all(
     ga: bool,
     stream: &StreamArgs,
     origin: &OriginArgs,
+    sets: &SetArgs,
 ) -> anyhow::Result<bool> {
     // The stream first: autoGa makes a provide GA on a build that declares one.
     let (stream, declared) = stream.resolve_declared(mode)?;
     let stability = Stability::resolve(ga.then_some(true), config.auto_ga, declared);
+    let annotations = sets.resolve(config, mode)?;
     let client = Client::from_config(config)?
         .with_stream(stream)
-        .with_origin(origin.resolve());
+        .with_origin(origin.resolve())
+        .with_annotations(annotations);
     let mut provided = false;
     for entry in &config.provides {
         if entry.retired {
@@ -371,7 +419,12 @@ fn provide_all(
     Ok(provided)
 }
 
-fn require(config: &Config, mode: &Mode, stream: &StreamArgs) -> anyhow::Result<()> {
+fn require(
+    config: &Config,
+    mode: &Mode,
+    stream: &StreamArgs,
+    sets: &SetArgs,
+) -> anyhow::Result<()> {
     let Some(service_name) = config.service_name.as_deref() else {
         return skip(mode, "serviceName", "require");
     };
@@ -380,8 +433,11 @@ fn require(config: &Config, mode: &Mode, stream: &StreamArgs) -> anyhow::Result<
     }
     let client = match Client::from_config(config)
         .map_err(anyhow::Error::from)
-        .and_then(|client| Ok(client.with_stream(stream.resolve(mode)?)))
-    {
+        .and_then(|client| {
+            Ok(client
+                .with_stream(stream.resolve(mode)?)
+                .with_annotations(sets.resolve(config, mode)?))
+        }) {
         Ok(client) => client,
         Err(err) => return soften(mode, Err(err)),
     };
@@ -412,7 +468,12 @@ fn require(config: &Config, mode: &Mode, stream: &StreamArgs) -> anyhow::Result<
 
 /// Strict checks only `serviceName` and `catalogInfo` here: a project with no
 /// provides or requires still has a periphery worth recording.
-fn catalog(config: &Config, mode: &Mode, stream: &StreamArgs) -> anyhow::Result<()> {
+fn catalog(
+    config: &Config,
+    mode: &Mode,
+    stream: &StreamArgs,
+    sets: &SetArgs,
+) -> anyhow::Result<()> {
     let Some(service_name) = config.service_name.as_deref() else {
         return skip(mode, "serviceName", "catalog");
     };
@@ -420,7 +481,9 @@ fn catalog(config: &Config, mode: &Mode, stream: &StreamArgs) -> anyhow::Result<
         return skip(mode, "catalogInfo", "catalog");
     };
     let push = || -> anyhow::Result<()> {
-        let client = Client::from_config(config)?.with_stream(stream.resolve(mode)?);
+        let client = Client::from_config(config)?
+            .with_stream(stream.resolve(mode)?)
+            .with_annotations(sets.resolve(config, mode)?);
         let recorded = client.catalog(service_name, catalog_info);
         let mut warnings = client.take_warnings();
         // The header names the reason; a service sending none still warns.
@@ -446,4 +509,19 @@ fn catalog(config: &Config, mode: &Mode, stream: &StreamArgs) -> anyhow::Result<
         Ok(())
     };
     soften(mode, push())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_set_splits_at_the_first_equals_sign() {
+        assert_eq!(parse_set("A=x=y"), Ok(("A".to_string(), "x=y".to_string())));
+        assert_eq!(parse_set("A="), Ok(("A".to_string(), String::new())));
+        assert_eq!(
+            parse_set("A"),
+            Err("expected NAME=value, got 'A'".to_string())
+        );
+    }
 }

@@ -1116,3 +1116,157 @@ fn a_retire_under_auto_ga_on_trunk_sends_no_stability() {
     let body = requests[0].split("\r\n\r\n").nth(1).unwrap_or("");
     assert_eq!(body, r#"{"producername":"demo-service","retired":true}"#);
 }
+
+// --- annotations ---
+
+const ANNOTATIONS_YAML: &str = "annotations:\n  - scope: version\n    name: requirements\n    value: \"http://solar.system/id-{{AREA}}/requirements/{{ID}}\"\n  - scope: system\n    name: jenkins\n    value: \"https://jenkins.corp/job/payments\"\n";
+
+const ID_LEFT_OUT: &str =
+    "annotation 'requirements' left out: {{ID}} is not set (--set ID=… or SANSHAIN_SET_ID)";
+
+fn body(request: &str) -> &str {
+    request.split("\r\n\r\n").nth(1).unwrap_or("")
+}
+
+#[test]
+fn provide_fills_the_annotations_from_set_and_the_environment() {
+    let (url, handle) = mock_server(vec![stored_response()]);
+    let dir = auto_ga_project("annotations_filled", &url, ANNOTATIONS_YAML);
+    let output = run(
+        &dir,
+        &["provide", "--set", "AREA=7"],
+        &[("SANSHAIN_SET_ID", "42")],
+    );
+    assert_success(&output);
+    assert_eq!(stderr(&output), "");
+    let requests = joined_requests(handle);
+    assert!(
+        body(&requests[0]).contains(
+            r#""annotations":[{"name":"requirements","scope":"version","value":"http://solar.system/id-7/requirements/42"},{"name":"jenkins","scope":"system","value":"https://jenkins.corp/job/payments"}]"#
+        ),
+        "{}",
+        requests[0]
+    );
+}
+
+#[test]
+fn an_unfilled_annotation_is_left_out_with_a_warning() {
+    let (url, handle) = mock_server(vec![stored_response()]);
+    let dir = auto_ga_project("annotations_unfilled", &url, ANNOTATIONS_YAML);
+    // An empty --set is no value and does not fall back to the environment.
+    let output = run(
+        &dir,
+        &["provide", "--set", "AREA=7", "--set", "ID="],
+        &[("SANSHAIN_SET_ID", "42")],
+    );
+    assert_success(&output);
+    assert_eq!(stderr(&output), format!("warning: {ID_LEFT_OUT}\n"));
+    let requests = joined_requests(handle);
+    let sent = body(&requests[0]);
+    assert!(
+        sent.contains(
+            r#""annotations":[{"name":"jenkins","scope":"system","value":"https://jenkins.corp/job/payments"}]"#
+        ),
+        "{sent}"
+    );
+    assert!(!sent.contains("requirements"), "{sent}");
+}
+
+#[test]
+fn an_unfilled_annotation_fails_under_strict_before_any_request() {
+    // Nothing listens on port 9: a request would fail differently.
+    for (name, args) in [
+        (
+            "annotations_strict_provide",
+            &["provide", "--best-effort"][..],
+        ),
+        (
+            "annotations_strict_require",
+            &["require", "--best-effort"][..],
+        ),
+        (
+            "annotations_strict_catalog",
+            &["catalog", "--best-effort"][..],
+        ),
+    ] {
+        let dir = project(name);
+        write_spec(&dir);
+        write(&dir.join("catalog-info.yaml"), "kind: Component\n");
+        write(
+            &dir.join("sanshain.yaml"),
+            &format!(
+                "serviceName: demo-service\nsanshainUrl: http://127.0.0.1:9\nstrict: true\ncatalogInfo: catalog-info.yaml\n{ANNOTATIONS_YAML}provides:\n  - file: specs/openapi.yaml\nrequires:\n  - serviceName: user-service\n    version: 1.2.0\n    outputDirectory: out\n    endpoints:\n      - method: GET\n        path: /x\n"
+            ),
+        );
+        let output = run(&dir, args, &[("SANSHAIN_SET_AREA", "7")]);
+        assert_failure(&output);
+        let err = stderr(&output);
+        assert!(
+            err.contains(&format!("warning: {ID_LEFT_OUT}")),
+            "{name}: {err}"
+        );
+        assert!(
+            err.contains(&format!("strict: {ID_LEFT_OUT}")),
+            "{name}: {err}"
+        );
+        assert!(!err.contains("Continuing (best effort)"), "{name}: {err}");
+        assert!(!err.contains("127.0.0.1:9"), "{name}: {err}");
+    }
+}
+
+#[test]
+fn a_set_value_may_hold_an_equals_sign() {
+    let (url, handle) = mock_server(vec![stored_response()]);
+    let dir = auto_ga_project(
+        "annotations_equals",
+        &url,
+        "annotations:\n  - scope: version\n    name: query\n    value: \"{{Q}}\"\n",
+    );
+    let output = run(&dir, &["provide", "--set", "Q=x=y"], &[]);
+    assert_success(&output);
+    let requests = joined_requests(handle);
+    assert!(
+        body(&requests[0])
+            .contains(r#""annotations":[{"name":"query","scope":"version","value":"x=y"}]"#),
+        "{}",
+        requests[0]
+    );
+}
+
+#[test]
+fn an_older_service_refusing_annotations_is_warned_about_once() {
+    let refused = http_response(
+        "400 Bad Request",
+        "Failed to deserialize query string: unknown field `annotations`, expected one of `consumername`, `producername`, `version`, `path`, `method`, `trunk`, `tag`, `format`",
+    );
+    let (url, handle) = mock_server(vec![
+        refused,
+        http_response("200 OK", "openapi: 3.0.3\n"),
+        http_response("200 OK", "openapi: 3.0.3\n"),
+    ]);
+    let dir = project("annotations_old_service");
+    write(
+        &dir.join("sanshain.yaml"),
+        &format!(
+            "serviceName: demo-service\nsanshainUrl: {url}\nstrict: true\n{ANNOTATIONS_YAML}requires:\n  - serviceName: user-service\n    version: 1.2.0\n    outputDirectory: out/a\n    endpoints:\n      - method: GET\n        path: /x\n  - serviceName: order-service\n    version: 2.0.0\n    outputDirectory: out/b\n    endpoints:\n      - method: GET\n        path: /y\n"
+        ),
+    );
+    // Strict, but the version annotation is filled: only the old service warns,
+    // and that warning is no reason to fail.
+    let output = run(&dir, &["require", "--set", "AREA=7", "--set", "ID=42"], &[]);
+    assert_success(&output);
+    let warning =
+        "warning: Sanshain Service before 2.13.0 does not take annotations; sending without them\n";
+    assert_eq!(stderr(&output), warning);
+    let requests = joined_requests(handle);
+    assert_eq!(requests.len(), 3, "{requests:?}");
+    assert!(
+        requests[0]
+            .lines()
+            .next()
+            .unwrap_or("")
+            .contains("annotations=")
+    );
+    assert!(!requests[1].contains("annotations"), "{}", requests[1]);
+    assert!(!requests[2].contains("annotations"), "{}", requests[2]);
+}
