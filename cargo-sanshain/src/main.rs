@@ -40,8 +40,9 @@ enum CargoCli {
     about = "Manage Sanshain API specs (speaks Sanshain Service 2.x)"
 )]
 struct SanshainArgs {
-    /// Turn failed calls into warnings and exit 0 (same as
-    /// SANSHAIN_BEST_EFFORT=true or bestEffort: true in sanshain.yaml)
+    /// Turn failed calls, and a missing or broken sanshain.yaml, into
+    /// warnings and exit 0 (same as SANSHAIN_BEST_EFFORT=true; bestEffort:
+    /// true in sanshain.yaml counts for failed calls only)
     #[arg(long, global = true)]
     best_effort: bool,
     #[command(subcommand)]
@@ -230,15 +231,34 @@ fn main() -> anyhow::Result<()> {
     // Clap's `bin_name = "cargo"` and the `CargoCli` enum handle this correctly.
     let CargoCli::Sanshain(args) = CargoCli::parse();
 
-    // Unreadable file, invalid YAML or a legacy field: nothing else is known.
-    // A broken sanshain.yaml is a configuration error, which best effort
-    // never softens: it covers failed calls only.
-    let loaded = Config::load_yaml_file(CONFIG_FILE)?;
+    let strict_env = env(STRICT_ENV_VAR);
+    // A missing or broken sanshain.yaml cannot be trusted to say `bestEffort`
+    // or `strict`, so only the flag and the environment decide for it: best
+    // effort makes it a warning and a clean exit, strict from the
+    // environment makes it fail anyway.
+    let outside = Mode {
+        strict: resolve_switch_with(false, strict_env.as_deref(), false),
+        best_effort: resolve_switch_with(
+            args.best_effort,
+            env(BEST_EFFORT_ENV_VAR).as_deref(),
+            false,
+        ),
+    };
+
+    // Missing or unreadable file, invalid YAML or a legacy field: nothing
+    // else is known.
+    let loaded = match Config::load_yaml_file(CONFIG_FILE) {
+        Ok(loaded) => loaded,
+        Err(err) => return soften(&outside, Err(broken(&outside, err))),
+    };
 
     // Once per run, right after the legacy rejections and before any other
     // validation, so a typo shows even when it causes the next error. Under
-    // strict an unknown field fails here, and best effort does not soften it.
-    let strict = resolve_switch_with(false, env(STRICT_ENV_VAR).as_deref(), loaded.strict);
+    // strict an unknown field fails here, and best effort does not soften it
+    // — unless the file does not validate and best effort comes from
+    // outside, where the file's own strict does not count.
+    let file_strict = loaded.strict && (loaded.config.is_ok() || !outside.best_effort);
+    let strict = resolve_switch_with(false, strict_env.as_deref(), file_strict);
     if let Some(cat) = puzzled_cat(&loaded.unknown_fields, strict) {
         eprintln!("{cat}");
         if strict {
@@ -246,7 +266,10 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    let config = loaded.config?;
+    let config = match loaded.config {
+        Ok(config) => config,
+        Err(err) => return soften(&outside, Err(broken(&outside, err))),
+    };
     let mode = Mode {
         strict,
         best_effort: resolve_switch_with(
@@ -265,6 +288,16 @@ fn main() -> anyhow::Result<()> {
         } => provide(&config, &mode, ga, &stream, &origin, &sets),
         Commands::Require { stream, sets } => require(&config, &mode, &stream, &sets),
         Commands::Catalog { stream, sets } => catalog(&config, &mode, &stream, &sets),
+    }
+}
+
+/// A missing or broken sanshain.yaml, as a failure strict mode demands when
+/// strict comes from the environment.
+fn broken(outside: &Mode, err: sanshain::Error) -> anyhow::Error {
+    if outside.strict {
+        StrictFailure(format!("strict: {err}")).into()
+    } else {
+        err.into()
     }
 }
 

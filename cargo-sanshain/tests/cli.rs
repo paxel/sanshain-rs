@@ -410,38 +410,193 @@ fn best_effort_does_not_soften_strict() {
     assert_failure(&run(&dir, &["provide", "--best-effort"], &[]));
 }
 
+// --- missing or broken sanshain.yaml ---
+
+/// Asserts the run failed with `cause` in stderr and best effort nowhere.
+fn assert_config_failure(output: &Output, cause: &str) {
+    assert_failure(output);
+    let err = stderr(output);
+    assert!(err.contains(cause), "unexpected stderr: {err}");
+    assert!(!err.contains("best effort"), "unexpected stderr: {err}");
+}
+
+/// Asserts the run printed `cause`, then `Continuing (best effort)`, made
+/// no call and exited 0.
+fn assert_config_softened(output: &Output, cause: &str) {
+    assert_success(output);
+    let err = stderr(output);
+    let Some(at) = err.find(cause) else {
+        panic!("unexpected stderr: {err}");
+    };
+    assert!(
+        err[at..].contains("Continuing (best effort)"),
+        "unexpected stderr: {err}"
+    );
+    assert_eq!(stdout(output), "", "unexpected stdout");
+}
+
+const NO_CONFIG: &str = "cannot read sanshain.yaml";
+
 #[test]
-fn an_unloadable_config_fails_also_with_best_effort() {
+fn a_missing_config_fails_naming_the_file() {
     let dir = project("no_config");
-    assert_failure(&run(&dir, &["provide"], &[]));
+    for command in ["provide", "require", "catalog"] {
+        assert_config_failure(&run(&dir, &[command], &[]), NO_CONFIG);
+    }
+    // `SANSHAIN_BEST_EFFORT=false` is off.
+    assert_config_failure(
+        &run(&dir, &["provide"], &[("SANSHAIN_BEST_EFFORT", "false")]),
+        NO_CONFIG,
+    );
+}
+
+#[test]
+fn best_effort_from_flag_or_env_turns_a_missing_config_into_a_warning() {
+    let dir = project("no_config_best_effort");
     for (args, envs) in [
-        (&["provide"][..], &[("SANSHAIN_BEST_EFFORT", "1")][..]),
-        (&["require", "--best-effort"][..], &[][..]),
+        (&["provide", "--best-effort"][..], &[][..]),
+        (&["--best-effort", "require"][..], &[][..]),
         (&["catalog", "--best-effort"][..], &[][..]),
+        (&["provide"][..], &[("SANSHAIN_BEST_EFFORT", "1")][..]),
+        (&["require"][..], &[("SANSHAIN_BEST_EFFORT", "true")][..]),
+        (&["catalog"][..], &[("SANSHAIN_BEST_EFFORT", "true")][..]),
     ] {
-        let output = run(&dir, args, envs);
-        assert_failure(&output);
-        let err = stderr(&output);
-        assert!(err.contains("cannot read"), "unexpected stderr: {err}");
-        assert!(!err.contains("best effort"), "unexpected stderr: {err}");
+        assert_config_softened(&run(&dir, args, envs), NO_CONFIG);
     }
 }
 
 #[test]
-fn an_invalid_config_fails_also_with_best_effort() {
+fn strict_from_env_fails_a_missing_config_also_with_best_effort() {
+    let dir = project("no_config_strict");
+    for (args, envs) in [
+        (
+            &["provide", "--best-effort"][..],
+            &[("SANSHAIN_STRICT", "true")][..],
+        ),
+        (
+            &["require"][..],
+            &[("SANSHAIN_STRICT", "1"), ("SANSHAIN_BEST_EFFORT", "true")][..],
+        ),
+        (
+            &["catalog", "--best-effort"][..],
+            &[("SANSHAIN_STRICT", "true")][..],
+        ),
+    ] {
+        let output = run(&dir, args, envs);
+        assert_config_failure(
+            &output,
+            &format!("strict: configuration error: {NO_CONFIG}"),
+        );
+    }
+}
+
+/// Invalid YAML and a 1.x field: both fail before anything else is read.
+const BROKEN_CONFIGS: [(&str, &str, &str); 2] = [
+    (
+        "invalid_yaml",
+        "serviceName: demo-service\nprovides: [\n",
+        "configuration error",
+    ),
+    (
+        "legacy_field",
+        "serviceName: demo-service\nrequires:\n  - serviceName: user-service\n    branch: main\n    outputDirectory: out\n    endpoints:\n      - method: GET\n        path: /x\n",
+        "'branch' is no longer supported",
+    ),
+];
+
+#[test]
+fn a_broken_config_fails_without_best_effort() {
+    for (name, yaml, cause) in BROKEN_CONFIGS {
+        let dir = project(&format!("broken_{name}"));
+        write(&dir.join("sanshain.yaml"), yaml);
+        for command in ["provide", "require", "catalog"] {
+            assert_config_failure(&run(&dir, &[command], &[]), cause);
+        }
+    }
+}
+
+#[test]
+fn best_effort_from_flag_or_env_turns_a_broken_config_into_a_warning() {
+    for (name, yaml, cause) in BROKEN_CONFIGS {
+        let dir = project(&format!("broken_best_effort_{name}"));
+        write(&dir.join("sanshain.yaml"), yaml);
+        for (args, envs) in [
+            (&["provide", "--best-effort"][..], &[][..]),
+            (&["require", "--best-effort"][..], &[][..]),
+            (&["catalog"][..], &[("SANSHAIN_BEST_EFFORT", "1")][..]),
+        ] {
+            assert_config_softened(&run(&dir, args, envs), cause);
+        }
+    }
+}
+
+#[test]
+fn a_broken_configs_own_best_effort_does_not_count() {
+    for (name, yaml, cause) in BROKEN_CONFIGS {
+        let dir = project(&format!("broken_own_best_effort_{name}"));
+        write(
+            &dir.join("sanshain.yaml"),
+            &format!("bestEffort: true\n{yaml}"),
+        );
+        assert_config_failure(&run(&dir, &["require"], &[]), cause);
+    }
+}
+
+#[test]
+fn strict_from_env_fails_a_broken_config_also_with_best_effort() {
+    for (name, yaml, cause) in BROKEN_CONFIGS {
+        let dir = project(&format!("broken_strict_{name}"));
+        write(&dir.join("sanshain.yaml"), yaml);
+        let output = run(
+            &dir,
+            &["require", "--best-effort"],
+            &[("SANSHAIN_STRICT", "true")],
+        );
+        assert_config_failure(&output, cause);
+        let err = stderr(&output);
+        assert!(err.contains("strict: "), "unexpected stderr: {err}");
+    }
+}
+
+/// An unsupported provide apiType: the file reads, but does not validate.
+const INVALID_PROVIDE: &str =
+    "serviceName: demo-service\nprovides:\n  - file: specs/openapi.yaml\n    apiType: raml\n";
+
+#[test]
+fn an_invalid_config_fails_without_best_effort_also_when_it_says_best_effort() {
+    let dir = project("invalid_config");
+    write(&dir.join("sanshain.yaml"), INVALID_PROVIDE);
+    assert_config_failure(&run(&dir, &["provide"], &[]), "invalid sanshain.yaml");
+    write(
+        &dir.join("sanshain.yaml"),
+        &format!("bestEffort: true\n{INVALID_PROVIDE}"),
+    );
+    assert_config_failure(&run(&dir, &["provide"], &[]), "invalid sanshain.yaml");
+}
+
+#[test]
+fn best_effort_turns_an_invalid_config_into_a_warning_whatever_its_own_strict() {
     let dir = project("invalid_config_best_effort");
     write(
         &dir.join("sanshain.yaml"),
-        "serviceName: demo-service\nbestEffort: true\nprovides:\n  - file: specs/openapi.yaml\n    apiType: raml\n",
+        &format!("strict: true\n{INVALID_PROVIDE}"),
     );
-    let output = run(&dir, &["provide", "--best-effort"], &[]);
-    assert_failure(&output);
-    let err = stderr(&output);
-    assert!(
-        err.contains("invalid sanshain.yaml"),
-        "unexpected stderr: {err}"
+    assert_config_softened(
+        &run(&dir, &["provide", "--best-effort"], &[]),
+        "invalid sanshain.yaml",
     );
-    assert!(!err.contains("best effort"), "unexpected stderr: {err}");
+    assert_config_softened(
+        &run(&dir, &["provide"], &[("SANSHAIN_BEST_EFFORT", "true")]),
+        "invalid sanshain.yaml",
+    );
+    assert_config_failure(
+        &run(
+            &dir,
+            &["provide", "--best-effort"],
+            &[("SANSHAIN_STRICT", "true")],
+        ),
+        "strict: configuration error: invalid sanshain.yaml",
+    );
 }
 
 #[test]
@@ -759,18 +914,13 @@ fn the_cat_shows_before_a_later_validation_error() {
 }
 
 #[test]
-fn the_cat_shows_before_a_validation_error_best_effort_does_not_soften() {
+fn the_cat_shows_before_a_validation_error_best_effort_softens() {
     let dir = project("cat_then_fallback");
     write(&dir.join("sanshain.yaml"), TYPO_THEN_MISSING_VERSION);
     let output = run(&dir, &["require", "--best-effort"], &[]);
-    assert_failure(&output);
+    assert_config_softened(&output, "missing 'version'");
     let err = stderr(&output);
     assert!(err.starts_with(CAT_VERISON), "unexpected stderr: {err}");
-    assert!(
-        err.contains("missing 'version'"),
-        "unexpected stderr: {err}"
-    );
-    assert!(!err.contains("best effort"), "unexpected stderr: {err}");
 }
 
 #[test]
@@ -780,7 +930,7 @@ fn under_strict_unknown_fields_fail_before_other_validation() {
         &dir.join("sanshain.yaml"),
         &format!("strict: true\n{TYPO_THEN_MISSING_VERSION}"),
     );
-    let output = run(&dir, &["require", "--best-effort"], &[]);
+    let output = run(&dir, &["require"], &[]);
     assert_failure(&output);
     let err = stderr(&output);
     assert!(
@@ -791,6 +941,28 @@ fn under_strict_unknown_fields_fail_before_other_validation() {
         !err.contains("missing 'version'"),
         "unexpected stderr: {err}"
     );
+}
+
+/// The file does not validate, so its own strict does not count once best
+/// effort comes from outside: the cat says ignored, and the run goes on.
+#[test]
+fn best_effort_softens_unknown_fields_under_the_files_strict_when_it_does_not_validate() {
+    let dir = project("cat_strict_best_effort");
+    write(
+        &dir.join("sanshain.yaml"),
+        &format!("strict: true\n{TYPO_THEN_MISSING_VERSION}"),
+    );
+    let output = run(&dir, &["require", "--best-effort"], &[]);
+    assert_config_softened(&output, "missing 'version'");
+    let err = stderr(&output);
+    assert!(err.starts_with(CAT_VERISON), "unexpected stderr: {err}");
+
+    let output = run(
+        &dir,
+        &["require", "--best-effort"],
+        &[("SANSHAIN_STRICT", "true")],
+    );
+    assert_config_failure(&output, "'requires[0].verison' - rejected (strict)");
 }
 
 #[test]
