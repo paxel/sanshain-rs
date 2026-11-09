@@ -79,7 +79,7 @@ jobs:
             # A crates.io version is immutable — republishing is a hard error,
             # so a re-run after a partial publish must skip what already landed.
             # Cargo waits for the index itself, so no sleep is needed between.
-            if curl -fsSL -A "sanshain-rs-release-workflow" \
+            if curl -fsSL --proto '=https' -A "sanshain-rs-release-workflow" \
                  "https://crates.io/api/v1/crates/$1/${ver}" >/dev/null 2>&1; then
               echo "$1 ${ver} already on crates.io — skipping"
             else
