@@ -1,5 +1,6 @@
 # Fails only when a dependency has a known vulnerability (RustSec advisories). Runs weekly and
 # on demand, because new advisories appear without any change in this repo.
+# The same audit also runs in CI on every push and pull request (ci.yml, same job name).
 # Warnings such as unmaintained or yanked packages are reported but never fail it.
 name: Security
 
