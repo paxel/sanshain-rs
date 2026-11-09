@@ -15,7 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Library: `Config` has new public fields (`auto_ga`, `annotations`), so code that builds a `Config` must be adapted.
 
 ### Changed
-- A missing or broken `sanshain.yaml` (unreadable, invalid YAML, 1.x fields, failed validation) under `--best-effort` or `SANSHAIN_BEST_EFFORT` prints the error, then `Continuing (best effort)`, and exits 0, now without the `Warning loading config:` prefix. `SANSHAIN_STRICT=true` makes it fail also with best effort, and a file that does not validate no longer fails over unknown fields because of its own `strict: true`; its own `bestEffort` still does not count. Without best effort a missing file fails, naming it, as before.
+- A missing or broken `sanshain.yaml` (unreadable, invalid YAML, 1.x fields, failed validation) under `--best-effort` or `SANSHAIN_BEST_EFFORT` prints the error, then `Continuing (best effort)`, and exits 0, now without the `Warning loading config:` prefix. `SANSHAIN_STRICT=true` makes it fail also with best effort, and under best effort a file that does not validate no longer fails over unknown fields because of its own `strict: true`; its own `bestEffort` still does not count. Without best effort a missing file fails, naming it, as before.
 
 ### Fixed
 - `apiType: grpc` is read as `proto` on provides and requires, as the other clients read it: a require goes to `/require/grpc` and is saved as `.proto`; the spelling was refused as an invalid `sanshain.yaml`.
