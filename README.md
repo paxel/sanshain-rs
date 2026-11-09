@@ -2,6 +2,10 @@
 
 [![CI](https://github.com/paxel/sanshain-rs/actions/workflows/ci.yml/badge.svg?branch=summer)](https://github.com/paxel/sanshain-rs/actions/workflows/ci.yml)
 [![Security](https://github.com/paxel/sanshain-rs/actions/workflows/security.yml/badge.svg?branch=summer)](https://github.com/paxel/sanshain-rs/actions/workflows/security.yml)
+[![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=paxel_sanshain-rs&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=paxel_sanshain-rs)
+[![Security Rating](https://sonarcloud.io/api/project_badges/measure?project=paxel_sanshain-rs&metric=security_rating)](https://sonarcloud.io/summary/new_code?id=paxel_sanshain-rs)
+[![Coverage](https://sonarcloud.io/api/project_badges/measure?project=paxel_sanshain-rs&metric=coverage)](https://sonarcloud.io/summary/new_code?id=paxel_sanshain-rs)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/paxel/sanshain-rs/badge)](https://scorecard.dev/viewer/?uri=github.com/paxel/sanshain-rs)
 [![crates.io sanshain](https://img.shields.io/crates/v/sanshain?label=sanshain)](https://crates.io/crates/sanshain)
 [![crates.io cargo-sanshain](https://img.shields.io/crates/v/cargo-sanshain?label=cargo-sanshain)](https://crates.io/crates/cargo-sanshain)
 [![MSRV 1.89](https://img.shields.io/badge/MSRV-1.89-blue)](https://github.com/paxel/sanshain-rs/actions/workflows/ci.yml)
