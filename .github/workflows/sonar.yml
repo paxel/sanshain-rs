@@ -1,0 +1,46 @@
+# SonarQube Cloud analysis of summer on every push there; the free plan
+# analyses the main branch only. Report only: the quality gate shows on
+# https://sonarcloud.io/summary/new_code?id=paxel_sanshain-rs and fails no
+# build. Clippy's findings and the coverage of one cargo llvm-cov run are
+# imported; what is analysed is in sonar-project.properties.
+#
+# One-time setup: the project paxel_sanshain-rs on SonarQube Cloud with
+# Automatic Analysis off, and the repository secret SQ_TOKEN.
+name: SonarQube Cloud
+
+on:
+  push:
+    branches: [summer]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  sonar:
+    name: SonarQube Cloud analysis
+    runs-on: ubuntu-latest
+    steps:
+      # The full history for the blame and the new-code period.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          components: clippy, llvm-tools-preview
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
+        with:
+          tool: cargo-llvm-cov
+      - name: Clippy report for the analyzer
+        run: |
+          mkdir -p build
+          cargo clippy --workspace --all-targets --locked --message-format=json > build/clippy-report.json
+      - name: Tests with coverage
+        run: cargo llvm-cov --workspace --locked --lcov --output-path build/lcov.info
+      - uses: SonarSource/sonarqube-scan-action@4d1dc0c91ee400dcf8a6dddf2f705ac36542e304 # v8.4.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SQ_TOKEN }}

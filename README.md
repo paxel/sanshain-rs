@@ -2,6 +2,10 @@
 
 [![CI](https://github.com/paxel/sanshain-rs/actions/workflows/ci.yml/badge.svg?branch=summer)](https://github.com/paxel/sanshain-rs/actions/workflows/ci.yml)
 [![Security](https://github.com/paxel/sanshain-rs/actions/workflows/security.yml/badge.svg?branch=summer)](https://github.com/paxel/sanshain-rs/actions/workflows/security.yml)
+[![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=paxel_sanshain-rs&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=paxel_sanshain-rs)
+[![Security Rating](https://sonarcloud.io/api/project_badges/measure?project=paxel_sanshain-rs&metric=security_rating)](https://sonarcloud.io/summary/new_code?id=paxel_sanshain-rs)
+[![Coverage](https://sonarcloud.io/api/project_badges/measure?project=paxel_sanshain-rs&metric=coverage)](https://sonarcloud.io/summary/new_code?id=paxel_sanshain-rs)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/paxel/sanshain-rs/badge)](https://scorecard.dev/viewer/?uri=github.com/paxel/sanshain-rs)
 [![crates.io sanshain](https://img.shields.io/crates/v/sanshain?label=sanshain)](https://crates.io/crates/sanshain)
 [![crates.io cargo-sanshain](https://img.shields.io/crates/v/cargo-sanshain?label=cargo-sanshain)](https://crates.io/crates/cargo-sanshain)
 [![MSRV 1.89](https://img.shields.io/badge/MSRV-1.89-blue)](https://github.com/paxel/sanshain-rs/actions/workflows/ci.yml)
@@ -13,11 +17,16 @@
 
 Rust client for the [Sanshain Service](https://github.com/paxel/sanshain-service): the
 [`sanshain`](sanshain) library and the [`cargo-sanshain`](cargo-sanshain) subcommand. A
-**Producer** provides its full API specification (OpenAPI, AsyncAPI, gRPC/Proto) under a
-producer-declared version; a **Consumer** requires only the endpoint snippets it needs,
+**Producer** provides its full API specification (OpenAPI, AsyncAPI, gRPC/Proto) under the
+version declared in the spec file; a **Consumer** requires only the endpoint snippets it needs,
 pinned to an exact version.
 
-**Compatibility: 3.x speaks Sanshain Service 2.x.**
+**The documentation lives on the Sanshain site: [Rust client](https://paxel.github.io/sanshain-service/developer/clients/rust.html).** It lists every flag,
+variable and `sanshain.yaml` field with the version it arrived in, the precedence, strict mode
+and best effort, the failure modes, CI recipes and the library API. The file itself is described
+in [`sanshain.yaml`](https://paxel.github.io/sanshain-service/developer/sanshain-yaml.html).
+
+**Compatibility: 4.x speaks Sanshain Service 2.x.** Rust 1.89 or later.
 
 | Crate                                | What it is                                              |
 |--------------------------------------|---------------------------------------------------------|
@@ -30,45 +39,30 @@ pinned to an exact version.
 $ cargo install cargo-sanshain
 ```
 
-## Configure
+## A minimal example
 
-`sanshain.yaml` in the project root — the same file every other Sanshain client reads:
+`sanshain.yaml` in the project root:
 
 ```yaml
 serviceName: gateway-service
-sanshainUrl: http://localhost:3000   # better: set SANSHAIN_URL in the environment
-catalogInfo: catalog-info.yaml       # optional: Backstage file for `cargo sanshain catalog`
-
 provides:
-  - file: specs/openapi.yaml         # version read from info.version
-  - file: specs/gateway.proto        # version from the // sanshain-version: marker
-    apiType: proto
-
+  - file: specs/openapi.yaml         # the version is read from info.version
 requires:
   - serviceName: user-service
-    version: 2.3.0                   # an exact pin — no ranges, no latest
+    version: 2.3.0                   # an exact pin
     outputDirectory: generated/user-service
     endpoints:
       - method: GET
         path: /api/v1/users/{id}
-      - method: POST
-        path: /api/v1/users
 ```
 
-## Use
+With `SANSHAIN_URL` and `SANSHAIN_TOKEN` in the environment:
 
 ```console
 $ cargo sanshain provide          # snapshot (the default)
-$ cargo sanshain provide --ga     # immutable GA release
-$ cargo sanshain require          # download the pinned snippets
-$ cargo sanshain catalog          # push catalog-info.yaml (needs Sanshain Service 2.4.0+)
+$ cargo sanshain provide --ga     # immutable GA, from the release pipeline
+$ cargo sanshain require          # writes generated/user-service/user-service.yaml
 ```
-
-Relative paths in `sanshain.yaml` resolve against the directory containing it. `catalog`
-needs Sanshain Service 2.4.0 or later; every other command works with any 2.x service.
-
-See the [library README](sanshain/README.md) for the configuration reference and the API,
-and the [subcommand README](cargo-sanshain/README.md) for the flags and CI recipes.
 
 ## Licence
 

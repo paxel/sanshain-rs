@@ -1,5 +1,6 @@
 # Fails only when a dependency has a known vulnerability (RustSec advisories). Runs weekly and
 # on demand, because new advisories appear without any change in this repo.
+# The same audit also runs in CI on every push and pull request (ci.yml, same job name).
 # Warnings such as unmaintained or yanked packages are reported but never fail it.
 name: Security
 
@@ -16,8 +17,8 @@ jobs:
     name: Vulnerable crates (cargo audit)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: taiki-e/install-action@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-audit
       - name: cargo audit

@@ -376,6 +376,31 @@ fn best_effort_require_carries_on_with_the_next_entry() {
 }
 
 #[test]
+fn a_grpc_require_goes_to_the_grpc_route_and_is_saved_as_proto() {
+    let dir = project("require_grpc");
+    let (url, handle) = mock_server(vec![http_response("200 OK", "syntax = \"proto3\";\n")]);
+    write(
+        &dir.join("sanshain.yaml"),
+        &format!(
+            "serviceName: demo-service\nsanshainUrl: {url}\nrequires:\n  - serviceName: greeter\n    apiType: grpc\n    version: 1.0.0\n    outputDirectory: out\n    endpoints:\n      - method: SayHello\n        path: helloworld.Greeter\n"
+        ),
+    );
+    let output = run(&dir, &["require"], &[]);
+    assert_success(&output);
+    let requests = joined_requests(handle);
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0].starts_with("GET /require/grpc?"),
+        "unexpected request: {}",
+        requests[0]
+    );
+    match std::fs::read_to_string(dir.join("out/greeter.proto")) {
+        Ok(content) => assert_eq!(content, "syntax = \"proto3\";\n"),
+        Err(err) => panic!("expected out/greeter.proto: {err}"),
+    }
+}
+
+#[test]
 fn best_effort_does_not_soften_strict() {
     let dir = project("be_and_strict");
     write(
@@ -385,13 +410,255 @@ fn best_effort_does_not_soften_strict() {
     assert_failure(&run(&dir, &["provide", "--best-effort"], &[]));
 }
 
+// --- missing or broken sanshain.yaml ---
+
+/// Asserts the run failed with `cause` in stderr and best effort nowhere.
+fn assert_config_failure(output: &Output, cause: &str) {
+    assert_failure(output);
+    let err = stderr(output);
+    assert!(err.contains(cause), "unexpected stderr: {err}");
+    assert!(!err.contains("best effort"), "unexpected stderr: {err}");
+}
+
+/// Asserts the run printed `cause`, then `Continuing (best effort)`, made
+/// no call and exited 0.
+fn assert_config_softened(output: &Output, cause: &str) {
+    assert_success(output);
+    let err = stderr(output);
+    let Some(at) = err.find(cause) else {
+        panic!("unexpected stderr: {err}");
+    };
+    assert!(
+        err[at..].contains("Continuing (best effort)"),
+        "unexpected stderr: {err}"
+    );
+    assert_eq!(stdout(output), "", "unexpected stdout");
+}
+
+const NO_CONFIG: &str = "cannot read sanshain.yaml";
+
 #[test]
-fn an_unloadable_config_is_a_warning_only_with_best_effort_from_flag_or_env() {
+fn a_missing_config_fails_naming_the_file() {
     let dir = project("no_config");
-    assert_failure(&run(&dir, &["provide"], &[]));
-    let output = run(&dir, &["provide"], &[("SANSHAIN_BEST_EFFORT", "1")]);
+    for command in ["provide", "require", "catalog"] {
+        assert_config_failure(&run(&dir, &[command], &[]), NO_CONFIG);
+    }
+    // `SANSHAIN_BEST_EFFORT=false` is off.
+    assert_config_failure(
+        &run(&dir, &["provide"], &[("SANSHAIN_BEST_EFFORT", "false")]),
+        NO_CONFIG,
+    );
+}
+
+#[test]
+fn best_effort_from_flag_or_env_turns_a_missing_config_into_a_warning() {
+    let dir = project("no_config_best_effort");
+    for (args, envs) in [
+        (&["provide", "--best-effort"][..], &[][..]),
+        (&["--best-effort", "require"][..], &[][..]),
+        (&["catalog", "--best-effort"][..], &[][..]),
+        (&["provide"][..], &[("SANSHAIN_BEST_EFFORT", "1")][..]),
+        (&["require"][..], &[("SANSHAIN_BEST_EFFORT", "true")][..]),
+        (&["catalog"][..], &[("SANSHAIN_BEST_EFFORT", "true")][..]),
+    ] {
+        assert_config_softened(&run(&dir, args, envs), NO_CONFIG);
+    }
+}
+
+#[test]
+fn strict_from_env_fails_a_missing_config_also_with_best_effort() {
+    let dir = project("no_config_strict");
+    for (args, envs) in [
+        (
+            &["provide", "--best-effort"][..],
+            &[("SANSHAIN_STRICT", "true")][..],
+        ),
+        (
+            &["require"][..],
+            &[("SANSHAIN_STRICT", "1"), ("SANSHAIN_BEST_EFFORT", "true")][..],
+        ),
+        (
+            &["catalog", "--best-effort"][..],
+            &[("SANSHAIN_STRICT", "true")][..],
+        ),
+    ] {
+        let output = run(&dir, args, envs);
+        assert_config_failure(
+            &output,
+            &format!("strict: configuration error: {NO_CONFIG}"),
+        );
+    }
+}
+
+/// Invalid YAML and a 1.x field: both fail before anything else is read.
+const BROKEN_CONFIGS: [(&str, &str, &str); 2] = [
+    (
+        "invalid_yaml",
+        "serviceName: demo-service\nprovides: [\n",
+        "configuration error",
+    ),
+    (
+        "legacy_field",
+        "serviceName: demo-service\nrequires:\n  - serviceName: user-service\n    branch: main\n    outputDirectory: out\n    endpoints:\n      - method: GET\n        path: /x\n",
+        "'branch' is no longer supported",
+    ),
+];
+
+#[test]
+fn a_broken_config_fails_without_best_effort() {
+    for (name, yaml, cause) in BROKEN_CONFIGS {
+        let dir = project(&format!("broken_{name}"));
+        write(&dir.join("sanshain.yaml"), yaml);
+        for command in ["provide", "require", "catalog"] {
+            assert_config_failure(&run(&dir, &[command], &[]), cause);
+        }
+    }
+}
+
+#[test]
+fn best_effort_from_flag_or_env_turns_a_broken_config_into_a_warning() {
+    for (name, yaml, cause) in BROKEN_CONFIGS {
+        let dir = project(&format!("broken_best_effort_{name}"));
+        write(&dir.join("sanshain.yaml"), yaml);
+        for (args, envs) in [
+            (&["provide", "--best-effort"][..], &[][..]),
+            (&["require", "--best-effort"][..], &[][..]),
+            (&["catalog"][..], &[("SANSHAIN_BEST_EFFORT", "1")][..]),
+        ] {
+            assert_config_softened(&run(&dir, args, envs), cause);
+        }
+    }
+}
+
+#[test]
+fn a_broken_configs_own_best_effort_does_not_count() {
+    for (name, yaml, cause) in BROKEN_CONFIGS {
+        let dir = project(&format!("broken_own_best_effort_{name}"));
+        write(
+            &dir.join("sanshain.yaml"),
+            &format!("bestEffort: true\n{yaml}"),
+        );
+        assert_config_failure(&run(&dir, &["require"], &[]), cause);
+    }
+}
+
+#[test]
+fn strict_from_env_fails_a_broken_config_also_with_best_effort() {
+    for (name, yaml, cause) in BROKEN_CONFIGS {
+        let dir = project(&format!("broken_strict_{name}"));
+        write(&dir.join("sanshain.yaml"), yaml);
+        let output = run(
+            &dir,
+            &["require", "--best-effort"],
+            &[("SANSHAIN_STRICT", "true")],
+        );
+        assert_config_failure(&output, cause);
+        let err = stderr(&output);
+        assert!(err.contains("strict: "), "unexpected stderr: {err}");
+    }
+}
+
+/// An unsupported provide apiType: the file reads, but does not validate.
+const INVALID_PROVIDE: &str =
+    "serviceName: demo-service\nprovides:\n  - file: specs/openapi.yaml\n    apiType: raml\n";
+
+#[test]
+fn an_invalid_config_fails_without_best_effort_also_when_it_says_best_effort() {
+    let dir = project("invalid_config");
+    write(&dir.join("sanshain.yaml"), INVALID_PROVIDE);
+    assert_config_failure(&run(&dir, &["provide"], &[]), "invalid sanshain.yaml");
+    write(
+        &dir.join("sanshain.yaml"),
+        &format!("bestEffort: true\n{INVALID_PROVIDE}"),
+    );
+    assert_config_failure(&run(&dir, &["provide"], &[]), "invalid sanshain.yaml");
+}
+
+#[test]
+fn best_effort_turns_an_invalid_config_into_a_warning_whatever_its_own_strict() {
+    let dir = project("invalid_config_best_effort");
+    write(
+        &dir.join("sanshain.yaml"),
+        &format!("strict: true\n{INVALID_PROVIDE}"),
+    );
+    assert_config_softened(
+        &run(&dir, &["provide", "--best-effort"], &[]),
+        "invalid sanshain.yaml",
+    );
+    assert_config_softened(
+        &run(&dir, &["provide"], &[("SANSHAIN_BEST_EFFORT", "true")]),
+        "invalid sanshain.yaml",
+    );
+    assert_config_failure(
+        &run(
+            &dir,
+            &["provide", "--best-effort"],
+            &[("SANSHAIN_STRICT", "true")],
+        ),
+        "strict: configuration error: invalid sanshain.yaml",
+    );
+}
+
+#[test]
+fn best_effort_provide_goes_on_after_a_failed_call() {
+    let dir = project("be_provide_next");
+    write_spec(&dir);
+    write(
+        &dir.join("specs/second.yaml"),
+        "openapi: 3.0.3\ninfo:\n  title: Second\n  version: 1.0.0\npaths: {}\n",
+    );
+    let (url, handle) = mock_server(vec![
+        conflict_response(),
+        version_response("2.3.0"),
+        http_response(
+            "202 Accepted",
+            r#"{"version":"1.0.0","stability":"snapshot","content_hash":"sha256:abc","changes":{"inserts":1,"updates":0,"deletes":0}}"#,
+        ),
+    ]);
+    write(
+        &dir.join("sanshain.yaml"),
+        &format!(
+            "serviceName: demo-service\nsanshainUrl: {url}\nprovides:\n  - file: specs/openapi.yaml\n  - file: specs/second.yaml\n"
+        ),
+    );
+    let output = run(&dir, &["provide", "--best-effort"], &[]);
     assert_success(&output);
-    assert!(stderr(&output).contains("Warning loading config"));
+    let err = stderr(&output);
+    assert!(err.contains("Publish as 1.5.0"), "unexpected stderr: {err}");
+    assert!(
+        err.contains("Continuing (best effort)"),
+        "unexpected stderr: {err}"
+    );
+    assert!(
+        !err.contains("No specification files found"),
+        "unexpected stderr: {err}"
+    );
+    assert!(
+        stdout(&output).contains("Stored version 1.0.0"),
+        "unexpected stdout: {}",
+        stdout(&output)
+    );
+    assert_eq!(joined_requests(handle).len(), 3);
+}
+
+#[test]
+fn a_missing_url_fails_under_strict_also_with_best_effort() {
+    let dir = project("strict_no_url");
+    write_spec(&dir);
+    write(&dir.join("catalog-info.yaml"), "kind: Component\n");
+    write(
+        &dir.join("sanshain.yaml"),
+        "serviceName: demo-service\nstrict: true\ncatalogInfo: catalog-info.yaml\nprovides:\n  - file: specs/openapi.yaml\nrequires:\n  - serviceName: user-service\n    version: 1.2.0\n    outputDirectory: out\n    endpoints:\n      - method: GET\n        path: /x\n",
+    );
+    for command in ["provide", "require", "catalog"] {
+        let output = run(&dir, &[command, "--best-effort"], &[]);
+        assert_failure(&output);
+        let err = stderr(&output);
+        assert!(
+            err.contains("strict: configuration error: missing 'sanshainUrl'"),
+            "{command}: unexpected stderr: {err}"
+        );
+    }
 }
 
 // --- the puzzled cat ---
@@ -647,17 +914,13 @@ fn the_cat_shows_before_a_later_validation_error() {
 }
 
 #[test]
-fn the_cat_shows_on_the_best_effort_fallback() {
+fn the_cat_shows_before_a_validation_error_best_effort_softens() {
     let dir = project("cat_then_fallback");
     write(&dir.join("sanshain.yaml"), TYPO_THEN_MISSING_VERSION);
     let output = run(&dir, &["require", "--best-effort"], &[]);
-    assert_success(&output);
+    assert_config_softened(&output, "missing 'version'");
     let err = stderr(&output);
     assert!(err.starts_with(CAT_VERISON), "unexpected stderr: {err}");
-    assert!(
-        err.contains("Warning loading config") && err.contains("missing 'version'"),
-        "unexpected stderr: {err}"
-    );
 }
 
 #[test]
@@ -667,7 +930,7 @@ fn under_strict_unknown_fields_fail_before_other_validation() {
         &dir.join("sanshain.yaml"),
         &format!("strict: true\n{TYPO_THEN_MISSING_VERSION}"),
     );
-    let output = run(&dir, &["require", "--best-effort"], &[]);
+    let output = run(&dir, &["require"], &[]);
     assert_failure(&output);
     let err = stderr(&output);
     assert!(
@@ -678,6 +941,28 @@ fn under_strict_unknown_fields_fail_before_other_validation() {
         !err.contains("missing 'version'"),
         "unexpected stderr: {err}"
     );
+}
+
+/// The file does not validate, so its own strict does not count once best
+/// effort comes from outside: the cat says ignored, and the run goes on.
+#[test]
+fn best_effort_softens_unknown_fields_under_the_files_strict_when_it_does_not_validate() {
+    let dir = project("cat_strict_best_effort");
+    write(
+        &dir.join("sanshain.yaml"),
+        &format!("strict: true\n{TYPO_THEN_MISSING_VERSION}"),
+    );
+    let output = run(&dir, &["require", "--best-effort"], &[]);
+    assert_config_softened(&output, "missing 'version'");
+    let err = stderr(&output);
+    assert!(err.starts_with(CAT_VERISON), "unexpected stderr: {err}");
+
+    let output = run(
+        &dir,
+        &["require", "--best-effort"],
+        &[("SANSHAIN_STRICT", "true")],
+    );
+    assert_config_failure(&output, "'requires[0].verison' - rejected (strict)");
 }
 
 #[test]
@@ -999,4 +1284,274 @@ fn an_unrecorded_catalog_warns_and_passes_unless_strict() {
         stderr(&output)
     );
     drop(joined_requests(handle));
+}
+
+// --- autoGa: GA on every trunk or tag build ---
+
+/// A project providing `specs/openapi.yaml` to `url`, with `extra_yaml` on top.
+fn auto_ga_project(name: &str, url: &str, extra_yaml: &str) -> PathBuf {
+    let dir = project(name);
+    write_spec(&dir);
+    write(
+        &dir.join("sanshain.yaml"),
+        &format!(
+            "serviceName: demo-service\nsanshainUrl: {url}\n{extra_yaml}provides:\n  - file: specs/openapi.yaml\n"
+        ),
+    );
+    dir
+}
+
+/// The `stability` the one provide of a run sent.
+fn sent_stability(handle: JoinHandle<Vec<String>>) -> String {
+    let requests = joined_requests(handle);
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    let body = requests[0].split("\r\n\r\n").nth(1).unwrap_or("");
+    let Some((_, rest)) = body.split_once(r#""stability":""#) else {
+        panic!("provide sent no stability: {body}");
+    };
+    rest.split('"').next().unwrap_or("").to_string()
+}
+
+/// Test name, extra `sanshain.yaml`, extra arguments, environment, stability.
+type AutoGaCase = (
+    &'static str,
+    &'static str,
+    &'static [&'static str],
+    &'static [(&'static str, &'static str)],
+    &'static str,
+);
+
+/// The autoGa table every Sanshain client tests. `--ga` is presence-only, so
+/// the row with an explicit `false` flag is covered by the library's tests.
+#[test]
+fn auto_ga_decides_only_when_no_switch_is_set() {
+    let cases: [AutoGaCase; 7] = [
+        ("auto_ga_trunk", "autoGa: true\n", &["--trunk"], &[], "ga"),
+        (
+            "auto_ga_tag",
+            "autoGa: true\n",
+            &[],
+            &[("SANSHAIN_TAG", "release-1")],
+            "ga",
+        ),
+        ("auto_ga_no_stream", "autoGa: true\n", &[], &[], "snapshot"),
+        (
+            "auto_ga_env_false",
+            "autoGa: true\n",
+            &["--trunk"],
+            &[("SANSHAIN_GA", "false")],
+            "snapshot",
+        ),
+        (
+            "auto_ga_off",
+            "autoGa: false\n",
+            &["--trunk"],
+            &[],
+            "snapshot",
+        ),
+        (
+            "auto_ga_absent_env_true",
+            "",
+            &[],
+            &[("SANSHAIN_GA", "true")],
+            "ga",
+        ),
+        (
+            "auto_ga_flag_beats_env",
+            "autoGa: true\n",
+            &["--ga"],
+            &[("SANSHAIN_GA", "false")],
+            "ga",
+        ),
+    ];
+    for (name, extra, args, envs, expected) in cases {
+        let (url, handle) = mock_server(vec![stored_response()]);
+        let dir = auto_ga_project(name, &url, extra);
+        let mut all_args = vec!["provide"];
+        all_args.extend_from_slice(args);
+        let output = run(&dir, &all_args, envs);
+        assert_success(&output);
+        assert!(
+            stdout(&output).contains(&format!("({expected})...")),
+            "{name}: {}",
+            stdout(&output)
+        );
+        assert_eq!(sent_stability(handle), expected, "{name}");
+    }
+}
+
+#[test]
+fn a_retire_under_auto_ga_on_trunk_sends_no_stability() {
+    let (url, handle) = mock_server(vec![http_response(
+        "200 OK",
+        r#"{"tag_cleared":"messaging","trunk_pins_closed":1,"contracts_released":0}"#,
+    )]);
+    let dir = project("auto_ga_retire");
+    write(
+        &dir.join("sanshain.yaml"),
+        &format!(
+            "serviceName: demo-service\nsanshainUrl: {url}\nautoGa: true\nprovides:\n  - file: specs/events.yaml\n    apiType: asyncapi\n    retired: true\n"
+        ),
+    );
+    let output = run(&dir, &["provide", "--trunk"], &[]);
+    assert_success(&output);
+    let requests = joined_requests(handle);
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert!(requests[0].starts_with("POST /provide/asyncapi "));
+    let body = requests[0].split("\r\n\r\n").nth(1).unwrap_or("");
+    assert_eq!(body, r#"{"producername":"demo-service","retired":true}"#);
+}
+
+// --- annotations ---
+
+const ANNOTATIONS_YAML: &str = "annotations:\n  - scope: version\n    name: requirements\n    value: \"http://solar.system/id-{{AREA}}/requirements/{{ID}}\"\n  - scope: system\n    name: jenkins\n    value: \"https://jenkins.corp/job/payments\"\n";
+
+const ID_LEFT_OUT: &str =
+    "annotation 'requirements' left out: {{ID}} is not set (--set ID=… or SANSHAIN_SET_ID)";
+
+fn body(request: &str) -> &str {
+    request.split("\r\n\r\n").nth(1).unwrap_or("")
+}
+
+#[test]
+fn provide_fills_the_annotations_from_set_and_the_environment() {
+    let (url, handle) = mock_server(vec![stored_response()]);
+    let dir = auto_ga_project("annotations_filled", &url, ANNOTATIONS_YAML);
+    let output = run(
+        &dir,
+        &["provide", "--set", "AREA=7"],
+        &[("SANSHAIN_SET_ID", "42")],
+    );
+    assert_success(&output);
+    assert_eq!(stderr(&output), "");
+    let requests = joined_requests(handle);
+    assert!(
+        body(&requests[0]).contains(
+            r#""annotations":[{"name":"requirements","scope":"version","value":"http://solar.system/id-7/requirements/42"},{"name":"jenkins","scope":"system","value":"https://jenkins.corp/job/payments"}]"#
+        ),
+        "{}",
+        requests[0]
+    );
+}
+
+#[test]
+fn an_unfilled_annotation_is_left_out_with_a_warning() {
+    let (url, handle) = mock_server(vec![stored_response()]);
+    let dir = auto_ga_project("annotations_unfilled", &url, ANNOTATIONS_YAML);
+    // An empty --set is no value and does not fall back to the environment.
+    let output = run(
+        &dir,
+        &["provide", "--set", "AREA=7", "--set", "ID="],
+        &[("SANSHAIN_SET_ID", "42")],
+    );
+    assert_success(&output);
+    assert_eq!(stderr(&output), format!("warning: {ID_LEFT_OUT}\n"));
+    let requests = joined_requests(handle);
+    let sent = body(&requests[0]);
+    assert!(
+        sent.contains(
+            r#""annotations":[{"name":"jenkins","scope":"system","value":"https://jenkins.corp/job/payments"}]"#
+        ),
+        "{sent}"
+    );
+    assert!(!sent.contains("requirements"), "{sent}");
+}
+
+#[test]
+fn an_unfilled_annotation_fails_under_strict_before_any_request() {
+    // Nothing listens on port 9: a request would fail differently.
+    for (name, args) in [
+        (
+            "annotations_strict_provide",
+            &["provide", "--best-effort"][..],
+        ),
+        (
+            "annotations_strict_require",
+            &["require", "--best-effort"][..],
+        ),
+        (
+            "annotations_strict_catalog",
+            &["catalog", "--best-effort"][..],
+        ),
+    ] {
+        let dir = project(name);
+        write_spec(&dir);
+        write(&dir.join("catalog-info.yaml"), "kind: Component\n");
+        write(
+            &dir.join("sanshain.yaml"),
+            &format!(
+                "serviceName: demo-service\nsanshainUrl: http://127.0.0.1:9\nstrict: true\ncatalogInfo: catalog-info.yaml\n{ANNOTATIONS_YAML}provides:\n  - file: specs/openapi.yaml\nrequires:\n  - serviceName: user-service\n    version: 1.2.0\n    outputDirectory: out\n    endpoints:\n      - method: GET\n        path: /x\n"
+            ),
+        );
+        let output = run(&dir, args, &[("SANSHAIN_SET_AREA", "7")]);
+        assert_failure(&output);
+        let err = stderr(&output);
+        assert!(
+            err.contains(&format!("warning: {ID_LEFT_OUT}")),
+            "{name}: {err}"
+        );
+        assert!(
+            err.contains(&format!("strict: {ID_LEFT_OUT}")),
+            "{name}: {err}"
+        );
+        assert!(!err.contains("Continuing (best effort)"), "{name}: {err}");
+        assert!(!err.contains("127.0.0.1:9"), "{name}: {err}");
+    }
+}
+
+#[test]
+fn a_set_value_may_hold_an_equals_sign() {
+    let (url, handle) = mock_server(vec![stored_response()]);
+    let dir = auto_ga_project(
+        "annotations_equals",
+        &url,
+        "annotations:\n  - scope: version\n    name: query\n    value: \"{{Q}}\"\n",
+    );
+    let output = run(&dir, &["provide", "--set", "Q=x=y"], &[]);
+    assert_success(&output);
+    let requests = joined_requests(handle);
+    assert!(
+        body(&requests[0])
+            .contains(r#""annotations":[{"name":"query","scope":"version","value":"x=y"}]"#),
+        "{}",
+        requests[0]
+    );
+}
+
+#[test]
+fn an_older_service_refusing_annotations_is_warned_about_once() {
+    let refused = http_response(
+        "400 Bad Request",
+        "Failed to deserialize query string: unknown field `annotations`, expected one of `consumername`, `producername`, `version`, `path`, `method`, `trunk`, `tag`, `format`",
+    );
+    let (url, handle) = mock_server(vec![
+        refused,
+        http_response("200 OK", "openapi: 3.0.3\n"),
+        http_response("200 OK", "openapi: 3.0.3\n"),
+    ]);
+    let dir = project("annotations_old_service");
+    write(
+        &dir.join("sanshain.yaml"),
+        &format!(
+            "serviceName: demo-service\nsanshainUrl: {url}\nstrict: true\n{ANNOTATIONS_YAML}requires:\n  - serviceName: user-service\n    version: 1.2.0\n    outputDirectory: out/a\n    endpoints:\n      - method: GET\n        path: /x\n  - serviceName: order-service\n    version: 2.0.0\n    outputDirectory: out/b\n    endpoints:\n      - method: GET\n        path: /y\n"
+        ),
+    );
+    // Strict, but the version annotation is filled: only the old service warns,
+    // and that warning is no reason to fail.
+    let output = run(&dir, &["require", "--set", "AREA=7", "--set", "ID=42"], &[]);
+    assert_success(&output);
+    let warning =
+        "warning: Sanshain Service before 2.13.0 does not take annotations; sending without them\n";
+    assert_eq!(stderr(&output), warning);
+    let requests = joined_requests(handle);
+    assert_eq!(requests.len(), 3, "{requests:?}");
+    assert!(
+        requests[0]
+            .lines()
+            .next()
+            .unwrap_or("")
+            .contains("annotations=")
+    );
+    assert!(!requests[1].contains("annotations"), "{}", requests[1]);
+    assert!(!requests[2].contains("annotations"), "{}", requests[2]);
 }

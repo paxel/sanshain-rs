@@ -33,11 +33,11 @@ jobs:
     name: Gate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # The mistake a hand-cut tag makes: tagging v2.1.0 without bumping the
       # manifest. crates.io publishes what the manifest says, so the tag would
       # name a version nobody can install.
@@ -57,8 +57,8 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7
-      - uses: softprops/action-gh-release@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           body_path: CHANGELOG.md
@@ -68,8 +68,8 @@ jobs:
     needs: release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
       - name: Publish in dependency order (skipping versions already on the index)
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
@@ -79,7 +79,7 @@ jobs:
             # A crates.io version is immutable — republishing is a hard error,
             # so a re-run after a partial publish must skip what already landed.
             # Cargo waits for the index itself, so no sleep is needed between.
-            if curl -fsSL -A "sanshain-rs-release-workflow" \
+            if curl -fsSL --proto '=https' -A "sanshain-rs-release-workflow" \
                  "https://crates.io/api/v1/crates/$1/${ver}" >/dev/null 2>&1; then
               echo "$1 ${ver} already on crates.io — skipping"
             else

@@ -2,8 +2,9 @@
 //! (OpenAPI, AsyncAPI, gRPC/Proto) under a producer-declared version, and
 //! **require** pinned endpoint snippets.
 //!
-//! Compatibility: **sanshain 2.x speaks Sanshain Service 2.x.** Only
-//! [`Client::catalog`] needs Sanshain Service 2.4.0 or later.
+//! Compatibility: **sanshain 4.x speaks Sanshain Service 2.x.** Only
+//! [`Client::catalog`] needs Sanshain Service 2.4.0 or later, and annotations
+//! ([`Client::with_annotations`]) need 2.13.0 or later.
 //!
 //! Configuration lives in `sanshain.yaml`, the same file every other Sanshain
 //! client reads.
@@ -11,7 +12,9 @@
 //! The spec version is never configured here — it lives in the spec file itself
 //! (`info.version` for OpenAPI/AsyncAPI, a `// sanshain-version:` comment for
 //! proto). Every provide declares a stability: `snapshot` by default, `ga` only
-//! via the explicit switch (`SANSHAIN_GA=true` or the CLI's `--ga`).
+//! via the explicit switch (`SANSHAIN_GA=true` or the CLI's `--ga`), or with
+//! `autoGa: true` on a build that declares trunk or a tag (see
+//! [`Stability::resolve`]).
 
 // Shipped code may not use `unsafe` and may not panic: no unwrap, expect or
 // panic or unreachable, no indexing or slicing that can go out of bounds, no
@@ -37,6 +40,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 use thiserror::Error;
@@ -66,6 +70,10 @@ pub const CHANGE_URL_ENV_VAR: &str = "SANSHAIN_CHANGE_URL";
 pub const TICKETS_ENV_VAR: &str = "SANSHAIN_TICKETS";
 /// Environment variable carrying one line of intent for this provide.
 pub const NOTE_ENV_VAR: &str = "SANSHAIN_NOTE";
+
+/// Prefix of the environment variables filling annotation placeholders:
+/// `SANSHAIN_SET_ID` fills `{{ID}}` when no `--set ID=…` does.
+pub const SET_ENV_PREFIX: &str = "SANSHAIN_SET_";
 
 /// The default configuration file name, in the project root.
 pub const CONFIG_FILE: &str = "sanshain.yaml";
@@ -145,17 +153,58 @@ pub fn resolve_switch_with(flag: bool, env: Option<&str>, configured: bool) -> b
 }
 
 /// Resolves the stability of a provide: the explicit `--ga` flag or
-/// `SANSHAIN_GA=true` switch to GA; everything else is a snapshot.
+/// `SANSHAIN_GA=true` switch to GA; everything else is a snapshot. Knows
+/// nothing of `autoGa`; see [`Stability::resolve`] for the full rule.
 pub fn resolve_stability(ga_flag: bool) -> Stability {
     resolve_stability_with(ga_flag, std::env::var(GA_ENV_VAR).ok().as_deref())
 }
 
 /// [`resolve_stability`] with the environment value passed in (testable).
 pub fn resolve_stability_with(ga_flag: bool, ga_env: Option<&str>) -> Stability {
-    if ga_flag || is_switch_on(ga_env) {
-        Stability::Ga
-    } else {
-        Stability::Snapshot
+    Stability::resolve_with(ga_flag.then_some(true), ga_env, false, false)
+}
+
+impl Stability {
+    /// The stability of a provide; the first of these that is set decides:
+    ///
+    /// 1. the explicit GA flag, `true` or `false` (`None` when not given);
+    /// 2. [`GA_ENV_VAR`] when it is not blank, read like every switch
+    ///    ([`is_switch_on`]), so an explicit `false` counts;
+    /// 3. `autoGa: true` ([`Config::auto_ga`]) on a build that declares a
+    ///    stream — trunk, a tag, or both;
+    /// 4. otherwise [`Stability::Snapshot`].
+    ///
+    /// There is no branch detection: the pipeline declares the stream (see
+    /// [`Stream`]), so only its protected trunk and release builds become GA.
+    /// Resolve the stream first; a build declaring both trunk and a tag
+    /// resolves to [`Stream::None`] with a warning but still declared one.
+    pub fn resolve(ga_flag: Option<bool>, auto_ga: bool, stream_declared: bool) -> Stability {
+        Stability::resolve_with(
+            ga_flag,
+            std::env::var(GA_ENV_VAR).ok().as_deref(),
+            auto_ga,
+            stream_declared,
+        )
+    }
+
+    /// [`Stability::resolve`] with the environment value passed in (testable).
+    pub fn resolve_with(
+        ga_flag: Option<bool>,
+        ga_env: Option<&str>,
+        auto_ga: bool,
+        stream_declared: bool,
+    ) -> Stability {
+        let env = ga_env.filter(|value| !value.trim().is_empty());
+        let ga = match (ga_flag, env) {
+            (Some(flag), _) => flag,
+            (None, Some(value)) => is_switch_on(Some(value)),
+            (None, None) => auto_ga && stream_declared,
+        };
+        if ga {
+            Stability::Ga
+        } else {
+            Stability::Snapshot
+        }
     }
 }
 
@@ -313,6 +362,151 @@ fn runner_change_url(env: &impl Fn(&str) -> Option<String>) -> Option<String> {
     first(&[env("CHANGE_URL")])
 }
 
+/// Where Sanshain stores an [`Annotation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AnnotationScope {
+    /// Stored with the provided version; sent on a provide only.
+    Version,
+    /// Stored with the system; sent on every call naming it except a retire.
+    System,
+}
+
+impl AnnotationScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AnnotationScope::Version => "version",
+            AnnotationScope::System => "system",
+        }
+    }
+}
+
+/// One `annotations` entry of `sanshain.yaml`: a named value Sanshain shows
+/// with the provided version or with the system. As configured, its value may
+/// hold `{{NAME}}` placeholders; [`fill_annotations`] fills them.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Annotation {
+    pub scope: AnnotationScope,
+    pub name: String,
+    pub value: String,
+}
+
+impl Annotation {
+    fn to_json(&self) -> Value {
+        json!({ "scope": self.scope.as_str(), "name": self.name, "value": self.value })
+    }
+}
+
+/// What [`fill_annotations`] made of the configured entries.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FilledAnnotations {
+    /// The entries whose placeholders were all filled, in file order.
+    pub annotations: Vec<Annotation>,
+    /// One warning per entry left out, naming it and its first unfilled
+    /// placeholder. The command prints them, and fails under strict mode,
+    /// before any request.
+    pub warnings: Vec<String>,
+}
+
+/// Fills the placeholders of the configured annotations from `--set NAME=value`
+/// pairs and the process environment; see [`fill_annotations_with`].
+pub fn fill_annotations(declared: &[Annotation], sets: &[(String, String)]) -> FilledAnnotations {
+    fill_annotations_with(declared, sets, |name| std::env::var(name).ok())
+}
+
+/// [`fill_annotations`] with the environment passed in (testable).
+///
+/// A placeholder is `{{NAME}}` with NAME of ASCII letters, digits and `_`;
+/// anything else between double braces (`{{ A }}`, `{{a-b}}`, `{{}}`) is
+/// literal text. Its value is the last `--set NAME=…` pair for NAME, else the
+/// environment variable `SANSHAIN_SET_NAME` (exact case); it counts as filled
+/// only when that value is not empty — an empty `--set` does not fall through
+/// to the environment. An entry with any unfilled placeholder is left out with
+/// a warning; the others are kept.
+pub fn fill_annotations_with(
+    declared: &[Annotation],
+    sets: &[(String, String)],
+    env: impl Fn(&str) -> Option<String>,
+) -> FilledAnnotations {
+    let flag = |name: &str| {
+        sets.iter()
+            .rev()
+            .find(|(set, _)| set == name)
+            .map(|(_, value)| value.clone())
+    };
+    let mut filled = FilledAnnotations::default();
+    for entry in declared {
+        match fill_placeholders(&entry.value, flag, &env) {
+            Ok(value) => filled.annotations.push(Annotation {
+                value,
+                ..entry.clone()
+            }),
+            Err(missing) => filled.warnings.push(format!(
+                "annotation '{}' left out: {{{{{missing}}}}} is not set (--set {missing}=… or {SET_ENV_PREFIX}{missing})",
+                entry.name
+            )),
+        }
+    }
+    filled
+}
+
+/// Fills every `{{NAME}}` of `template`: the flag first, else the
+/// environment variable `SANSHAIN_SET_NAME`. The error is the first
+/// placeholder without a non-empty value.
+fn fill_placeholders(
+    template: &str,
+    flag: impl Fn(&str) -> Option<String>,
+    env: impl Fn(&str) -> Option<String>,
+) -> std::result::Result<String, String> {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(start) = rest.find("{{") {
+        let Some((before, from_braces)) = rest.split_at_checked(start) else {
+            break;
+        };
+        out.push_str(before);
+        // `from_braces` starts with "{{"; `next` starts at the second brace.
+        let next = from_braces.strip_prefix('{').unwrap_or(from_braces);
+        let inner = next.strip_prefix('{').unwrap_or(next);
+        let placeholder = inner.split_once("}}").filter(|(name, _)| {
+            !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        });
+        match placeholder {
+            Some((name, after)) => {
+                let value = match flag(name) {
+                    Some(value) => Some(value),
+                    None => env(&format!("{SET_ENV_PREFIX}{name}")),
+                };
+                match value.filter(|value| !value.is_empty()) {
+                    Some(value) => out.push_str(&value),
+                    None => return Err(name.to_string()),
+                }
+                rest = after;
+            }
+            // Not a placeholder: the first brace is text, and the scan
+            // goes on from the second, as a regex search would.
+            None => {
+                out.push('{');
+                rest = next;
+            }
+        }
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// What a call prints, once per [`Client`], when an older service refused the
+/// annotations and the call was repeated without them.
+pub const ANNOTATIONS_DROPPED_WARNING: &str =
+    "Sanshain Service before 2.13.0 does not take annotations; sending without them";
+
+/// Whether a refusal names `annotations` as the unknown field. Matched
+/// exactly: the refusals of 2.9–2.12 list every field they know after
+/// "expected one of", so the bare word is not enough.
+pub(crate) fn annotations_field_refused(body: &str) -> bool {
+    body.contains("unknown field `annotations`")
+}
+
 /// Which dependency graph a build's calls belong to: trunk, a named
 /// sanshain-branch, or neither.
 ///
@@ -427,13 +621,15 @@ impl std::fmt::Display for Stream {
     }
 }
 
-/// The API type of a provide/require entry.
+/// The API type of a provide/require entry. `grpc` is read as `proto`, the
+/// spelling of the service's routes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ApiType {
     #[default]
     OpenApi,
     AsyncApi,
+    #[serde(alias = "grpc")]
     Proto,
 }
 
@@ -551,7 +747,7 @@ impl RequireFormat {
     }
 }
 
-/// Configuration from `[package.metadata.sanshain]` in `Cargo.toml`.
+/// Configuration from `sanshain.yaml` in the project root (see [`CONFIG_FILE`]).
 #[derive(Debug, Clone)]
 pub struct Config {
     pub sanshain_url: Option<String>,
@@ -569,6 +765,13 @@ pub struct Config {
     /// `catalogInfo`: the project's Backstage `catalog-info.yaml`, pushed by
     /// [`Client::catalog`].
     pub catalog_info: Option<PathBuf>,
+    /// `autoGa` from `sanshain.yaml`: a provide is GA whenever the build
+    /// declares trunk or a tag, unless the GA switch says otherwise. See
+    /// [`Stability::resolve`].
+    pub auto_ga: bool,
+    /// `annotations`: the entries as written, placeholders unfilled. See
+    /// [`fill_annotations`] and [`Client::with_annotations`].
+    pub annotations: Vec<Annotation>,
     /// Fields no Sanshain client knows, as paths in file order
     /// (`provides[1].verison`). Parsing ignores them; see [`puzzled_cat`].
     pub unknown_fields: Vec<String>,
@@ -589,6 +792,9 @@ struct RawConfig {
     #[serde(default)]
     best_effort: bool,
     catalog_info: Option<PathBuf>,
+    #[serde(default)]
+    auto_ga: bool,
+    annotations: Option<Vec<Annotation>>,
 }
 
 /// Config fields removed in the 2.0 model, rejected by name with a migration hint.
@@ -648,6 +854,8 @@ const KNOWN_TOP_FIELDS: &[&str] = &[
     "insecure",
     "combine",
     "catalogInfo",
+    "autoGa",
+    "annotations",
     "provide",
     "provides",
     "requires",
@@ -670,6 +878,7 @@ const KNOWN_REQUIRE_FIELDS: &[&str] = &[
     "format",
 ];
 const KNOWN_ENDPOINT_FIELDS: &[&str] = &["method", "path"];
+const KNOWN_ANNOTATION_FIELDS: &[&str] = &["scope", "name", "value"];
 
 /// Parser options, as in the Sanshain service: only `true` and `false` are
 /// booleans (YAML 1.2), so `no` or `on` stays the string it was written as,
@@ -855,6 +1064,12 @@ fn unknown_fields(value: &YamlNode) -> Vec<String> {
                     collect_unknown(entry, KNOWN_PROVIDE_FIELDS, &prefix, &mut out);
                 }
             }
+            "annotations" => {
+                for (i, entry) in value.items().iter().enumerate() {
+                    let prefix = format!("annotations[{i}].");
+                    collect_unknown(entry, KNOWN_ANNOTATION_FIELDS, &prefix, &mut out);
+                }
+            }
             "requires" => {
                 for (i, entry) in value.items().iter().enumerate() {
                     for (field, field_value) in entry.entries() {
@@ -1010,10 +1225,57 @@ fn check_format(context: &str, format: &Value, api_type: Option<&Value>) -> Resu
     Ok(())
 }
 
+/// The `annotations` list: every entry has the strings `scope` (`version` or
+/// `system`), `name` and `value`. A violation names its entry; the size limits
+/// are the service's to check. An extra key is an unknown field, not an error.
+fn check_annotations(annotations: Option<&Value>) -> Result<()> {
+    let entries = match annotations {
+        None | Some(Value::Null) => return Ok(()),
+        Some(Value::Array(entries)) => entries,
+        Some(_) => {
+            return Err(Error::Config(
+                "annotations: must be a list of entries with scope, name and value".to_string(),
+            ));
+        }
+    };
+    for (i, entry) in entries.iter().enumerate() {
+        let Some(obj) = entry.as_object() else {
+            return Err(Error::Config(format!(
+                "annotations[{i}]: must be an entry with scope, name and value"
+            )));
+        };
+        let context = match obj.get("name").and_then(Value::as_str) {
+            Some(name) => format!("annotations[{i}] ({name})"),
+            None => format!("annotations[{i}]"),
+        };
+        for field in KNOWN_ANNOTATION_FIELDS {
+            match obj.get(*field) {
+                None | Some(Value::Null) => {
+                    return Err(Error::Config(format!("{context}: missing '{field}'")));
+                }
+                Some(Value::String(_)) => {}
+                Some(_) => {
+                    return Err(Error::Config(format!(
+                        "{context}: '{field}' must be a string"
+                    )));
+                }
+            }
+        }
+        let scope = obj.get("scope").and_then(Value::as_str).unwrap_or_default();
+        if scope != "version" && scope != "system" {
+            return Err(Error::Config(format!(
+                "{context}: scope '{scope}' is not supported — use version or system"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Everything after the legacy rejections and the unknown-field detection:
 /// pins, endpoints, and the shape of each field.
 fn validate(value: &Value, unknown_fields: Vec<String>) -> Result<Config> {
     let obj = as_mapping(value)?;
+    check_annotations(obj.get("annotations"))?;
     if let Some(Value::Array(list)) = obj.get("requires") {
         for (i, entry) in list.iter().enumerate() {
             let Some(entry_obj) = entry.as_object() else {
@@ -1067,6 +1329,8 @@ fn validate(value: &Value, unknown_fields: Vec<String>) -> Result<Config> {
         strict: raw.strict,
         best_effort: raw.best_effort,
         catalog_info: raw.catalog_info,
+        auto_ga: raw.auto_ga,
+        annotations: raw.annotations.unwrap_or_default(),
         unknown_fields,
     })
 }
@@ -1149,9 +1413,11 @@ impl Config {
 }
 
 /// Resolves the server base URL: the `SANSHAIN_URL` environment variable wins
-/// over the configured `sanshainUrl`; missing both is a configuration error.
+/// over the configured `sanshainUrl`, unless it is empty (an empty variable
+/// counts as unset); missing both is a configuration error.
 pub fn resolve_url(config_url: Option<&str>, env_url: Option<&str>) -> Result<String> {
     env_url
+        .filter(|u| !u.trim().is_empty())
         .or(config_url)
         .map(|u| u.trim_end_matches('/').to_string())
         .filter(|u| !u.is_empty())
@@ -1435,11 +1701,20 @@ pub(crate) fn provide_error_message(
         // Releasing is a permission, not merely an authenticated act, and the
         // remedy is a role grant — nothing the Producer can change in its own
         // repository. Naming it is the whole value of catching this status.
-        403 => format!(
-            "provide refused (403): {server_message}\nPublishing a GA version requires the 'releaser' role. Grant it to the user or token this build authenticates as (administrators and root always hold it), or publish as a snapshot by leaving --ga / {GA_ENV_VAR} unset."
+        403 if names_releaser_role(&server_message) => format!(
+            "provide refused (403): {server_message}\nPublishing a GA version requires the 'releaser' role. Grant it to the user or token this build authenticates as (administrators and root always hold it), or publish as a snapshot by leaving --ga / {GA_ENV_VAR} unset and autoGa off (or setting {GA_ENV_VAR}=false)."
         ),
+        403 => format!("provide refused (403): {server_message}"),
         _ => format!("provide failed ({status}): {server_message}"),
     }
+}
+
+/// Whether a 403 is the service's refusal for a caller without the releaser
+/// role. Its body carries no code, only the sentence ("… requires the
+/// 'releaser' role …"); every other 403, a read-only token's among them, is
+/// shown as the service wrote it.
+fn names_releaser_role(server_message: &str) -> bool {
+    server_message.contains("requires the 'releaser' role")
 }
 
 /// Formats a failed retire. Retiring is gated like releasing, but reachable two
@@ -1448,9 +1723,10 @@ pub(crate) fn retire_error_message(status: u16, body: &str, producername: &str) 
     let parsed: Option<ErrorBody> = serde_json::from_str(body).ok();
     let server_message = parsed.map_or_else(|| fallback_message(body), |b| b.error);
     match status {
-        403 => format!(
+        403 if names_releaser_role(&server_message) => format!(
             "retire refused (403): {server_message}\nRetiring an API family requires the 'releaser' role — which a release pipeline already holds — or a maintainer grant on '{producername}'. Administrators and root hold both."
         ),
+        403 => format!("retire refused (403): {server_message}"),
         404 => format!(
             "retire failed (404): {server_message}\nNothing was ever provided as '{producername}', so there is no family to retire."
         ),
@@ -1569,6 +1845,10 @@ pub struct Client {
     token: Option<String>,
     stream: Stream,
     origin: Origin,
+    /// The filled annotations; see [`Client::with_annotations`].
+    annotations: Vec<Annotation>,
+    /// Set once the service refused annotations: later calls send none.
+    annotations_refused: AtomicBool,
     /// Every [`WARNING_HEADER`] value received and not yet taken.
     warnings: Mutex<Vec<String>>,
     agent: ureq::Agent,
@@ -1580,6 +1860,8 @@ type Response = ureq::http::Response<ureq::Body>;
 /// the request never got an answer.
 enum Failure {
     Status(u16, Box<Response>),
+    /// An error status whose body was already read (and its warnings kept).
+    Answered(u16, String),
     Transport(ureq::Error),
 }
 
@@ -1645,6 +1927,8 @@ impl Client {
             token,
             stream: Stream::None,
             origin: Origin::default(),
+            annotations: Vec::new(),
+            annotations_refused: AtomicBool::new(false),
             warnings: Mutex::new(Vec::new()),
             agent: agent(),
         }
@@ -1666,9 +1950,74 @@ impl Client {
         self
     }
 
+    /// Declares the build's annotations, placeholders already filled (see
+    /// [`fill_annotations`]). A provide sends all of them; a require, a
+    /// bundle and a catalog push send the [`AnnotationScope::System`] ones; a
+    /// retire sends none. A field without entries is not sent at all.
+    ///
+    /// Needs Sanshain Service 2.13.0 or later. An older service refuses the
+    /// field by name; the call is then repeated once without it, this client
+    /// sends no annotations from then on, and [`ANNOTATIONS_DROPPED_WARNING`]
+    /// is printed once.
+    pub fn with_annotations(mut self, annotations: Vec<Annotation>) -> Self {
+        self.annotations = annotations;
+        self
+    }
+
     /// The stream this client declares on every call.
     pub fn stream(&self) -> &Stream {
         &self.stream
+    }
+
+    /// The annotations a call sends as JSON: all of them on a provide, else
+    /// the system ones — `None` when that leaves none, or once the service
+    /// refused them.
+    fn annotations_json(&self, provide: bool) -> Option<Value> {
+        if self.annotations_refused.load(Ordering::Relaxed) {
+            return None;
+        }
+        let entries: Vec<Value> = self
+            .annotations
+            .iter()
+            .filter(|entry| provide || entry.scope == AnnotationScope::System)
+            .map(Annotation::to_json)
+            .collect();
+        (!entries.is_empty()).then_some(Value::Array(entries))
+    }
+
+    /// Stops sending annotations, warning the first time.
+    fn refuse_annotations(&self) {
+        if !self.annotations_refused.swap(true, Ordering::Relaxed) {
+            eprintln!("warning: {ANNOTATIONS_DROPPED_WARNING}");
+        }
+    }
+
+    /// Sends with the annotations, and once more without them when the
+    /// answer is `refused_status` naming them as an unknown field — what a
+    /// service before 2.13.0 says. Any other refusal is handed back with its
+    /// body read.
+    fn send_annotated(
+        &self,
+        annotations: Option<Value>,
+        refused_status: u16,
+        send: impl Fn(Option<&Value>) -> std::result::Result<Response, Failure>,
+    ) -> std::result::Result<Response, Failure> {
+        let Some(annotations) = annotations else {
+            return send(None);
+        };
+        match send(Some(&annotations)) {
+            Err(Failure::Status(status, mut response)) if status == refused_status => {
+                self.record_warnings(&response);
+                let body = body_string(&mut response).unwrap_or_default();
+                if annotations_field_refused(&body) {
+                    self.refuse_annotations();
+                    send(None)
+                } else {
+                    Err(Failure::Answered(status, body))
+                }
+            }
+            other => other,
+        }
     }
 
     /// Creates a client from the configuration plus the `SANSHAIN_URL` /
@@ -1724,37 +2073,48 @@ impl Client {
         stability: Stability,
     ) -> Result<ProvideResponse> {
         let content = fs::read_to_string(&entry.file)?;
-        let mut payload = provide_payload(
+        let plain = provide_payload(
             producername,
             entry.api_type,
             &content,
             stability,
             &self.stream,
         );
-        let plain = payload.clone();
-        if let Some(map) = payload.as_object_mut() {
-            self.origin.apply_to_payload(map);
-        }
+        let annotations = self.annotations_json(true);
+        let mut send_annotations = annotations.is_some();
+        let mut send_origin = !self.origin.is_empty();
         let url = format!("{}{}", self.base_url, entry.api_type.provide_path());
-        let sent = match checked(send_json(self.with_auth(self.agent.post(&url)), &payload)) {
-            // A service before 2.9.0 refuses the origin fields by name: the
-            // provide must not fail for a fact the service cannot store, so it
-            // is repeated without them.
-            Err(Failure::Status(422, mut response)) if !self.origin.is_empty() => {
-                self.record_warnings(&response);
-                let body = body_string(&mut response).unwrap_or_default();
-                if !origin_field_refused(&body) {
-                    return Err(Error::Api(provide_error_message(
-                        422,
-                        &body,
-                        entry.api_type,
-                        &entry.file,
-                    )));
+        let sent = loop {
+            let mut payload = plain.clone();
+            if let Some(map) = payload.as_object_mut() {
+                if send_origin {
+                    self.origin.apply_to_payload(map);
                 }
-                eprintln!("warning: {ORIGIN_DROPPED_WARNING}");
-                checked(send_json(self.with_auth(self.agent.post(&url)), &plain))
+                if let (true, Some(annotations)) = (send_annotations, &annotations) {
+                    map.insert("annotations".to_string(), annotations.clone());
+                }
             }
-            other => other,
+            match checked(send_json(self.with_auth(self.agent.post(&url)), &payload)) {
+                // An older service refuses a field it does not know by name,
+                // one field per answer: annotations before 2.13.0, the origin
+                // before 2.9.0. The provide must not fail for a fact the
+                // service cannot store, so each refusal drops that field and
+                // repeats it; a 2.8 service refuses both, in either order.
+                Err(Failure::Status(422, mut response)) if send_annotations || send_origin => {
+                    self.record_warnings(&response);
+                    let body = body_string(&mut response).unwrap_or_default();
+                    if send_annotations && annotations_field_refused(&body) {
+                        self.refuse_annotations();
+                        send_annotations = false;
+                    } else if send_origin && origin_field_refused(&body) {
+                        eprintln!("warning: {ORIGIN_DROPPED_WARNING}");
+                        send_origin = false;
+                    } else {
+                        break Err(Failure::Answered(422, body));
+                    }
+                }
+                other => break other,
+            }
         };
         match sent {
             Ok(mut response) => {
@@ -1798,23 +2158,35 @@ impl Client {
     /// `outputDirectory`. Returns the path of the written file. A single
     /// endpoint uses `GET /require*`; several use `POST /require-bundle`.
     pub fn require(&self, consumername: &str, entry: &RequireEntry) -> Result<PathBuf> {
+        let annotations = self.annotations_json(false);
         let result = if let [endpoint] = entry.endpoints.as_slice() {
             let url = format!("{}{}", self.base_url, entry.api_type.require_path());
-            let mut request = self.with_auth(self.agent.get(&url));
-            for (key, value) in require_query(consumername, entry, endpoint, &self.stream) {
-                request = request.query(key, value);
-            }
-            checked(request.call())
+            // A service before 2.13.0 refuses the unknown query parameter
+            // with a 400 — checked before the `format` refusal, since it
+            // lists `format` among the fields it expects.
+            self.send_annotated(annotations, 400, |annotations| {
+                let mut request = self.with_auth(self.agent.get(&url));
+                for (key, value) in require_query(consumername, entry, endpoint, &self.stream) {
+                    request = request.query(key, value);
+                }
+                if let Some(annotations) = annotations {
+                    request = request.query("annotations", annotations.to_string());
+                }
+                checked(request.call())
+            })
         } else {
             let url = format!("{}/require-bundle", self.base_url);
-            let mut request = self.with_auth(self.agent.post(&url));
-            for (key, value) in format_query(entry) {
-                request = request.query(key, value);
-            }
-            checked(send_json(
-                request,
-                &require_bundle_payload(consumername, entry, &self.stream),
-            ))
+            self.send_annotated(annotations, 422, |annotations| {
+                let mut request = self.with_auth(self.agent.post(&url));
+                for (key, value) in format_query(entry) {
+                    request = request.query(key, value);
+                }
+                let mut payload = require_bundle_payload(consumername, entry, &self.stream);
+                if let (Some(map), Some(annotations)) = (payload.as_object_mut(), annotations) {
+                    map.insert("annotations".to_string(), annotations.clone());
+                }
+                checked(send_json(request, &payload))
+            })
         };
         match result {
             Ok(mut response) => {
@@ -1870,10 +2242,14 @@ impl Client {
             self.base_url,
             encode_path_segment(service_name)
         );
-        match checked(send_json(
-            self.with_auth(self.agent.put(&url)),
-            &catalog_payload(&content, &self.stream),
-        )) {
+        let sent = self.send_annotated(self.annotations_json(false), 422, |annotations| {
+            let mut payload = catalog_payload(&content, &self.stream);
+            if let (Some(map), Some(annotations)) = (payload.as_object_mut(), annotations) {
+                map.insert("annotations".to_string(), annotations.clone());
+            }
+            checked(send_json(self.with_auth(self.agent.put(&url)), &payload))
+        });
+        match sent {
             Ok(mut response) => {
                 self.record_warnings(&response);
                 body_json(&mut response)
@@ -1905,6 +2281,9 @@ impl Client {
         match err {
             Failure::Status(status, mut response) => {
                 let body = body_string(&mut response).unwrap_or_default();
+                Error::Api(describe(status, &body, server_version.as_deref()))
+            }
+            Failure::Answered(status, body) => {
                 Error::Api(describe(status, &body, server_version.as_deref()))
             }
             Failure::Transport(transport) => Error::Http(transport.to_string()),
@@ -1982,6 +2361,21 @@ mod tests {
         assert_eq!(config.requires.len(), 1);
         assert_eq!(config.requires[0].version, "2.3.0");
         assert_eq!(config.requires[0].endpoints[0].method, "GET");
+    }
+
+    #[test]
+    fn grpc_is_proto_for_provides_and_requires() {
+        let mut value = valid_config_value();
+        value["provides"][1]["apiType"] = json!("grpc");
+        value["requires"][0]["apiType"] = json!("grpc");
+        let config = match Config::from_value(&value) {
+            Ok(config) => config,
+            Err(err) => panic!("expected valid config, got {err}"),
+        };
+        assert_eq!(config.provides[1].api_type, ApiType::Proto);
+        assert_eq!(config.requires[0].api_type, ApiType::Proto);
+        assert_eq!(config.requires[0].api_type.require_path(), "/require/grpc");
+        assert_eq!(config.requires[0].api_type.file_extension(), "proto");
     }
 
     #[test]
@@ -2290,6 +2684,10 @@ catalogInf: x
 sanshainUrl: http://x
 serviceName: s
 clientName: c
+annotations:
+  - scope: system
+    name: jenkins
+    value: https://jenkins.corp/job/payments
 compression: true
 bestEffort: false
 strict: false
@@ -2297,6 +2695,7 @@ force: true
 insecure: true
 combine: true
 catalogInfo: catalog-info.yaml
+autoGa: true
 provide:
   file: a.yaml
   apiType: openapi
@@ -2581,6 +2980,78 @@ requires:
         assert_eq!(resolve_stability_with(true, None), Stability::Ga);
         // The explicit flag wins even when the environment says otherwise.
         assert_eq!(resolve_stability_with(true, Some("false")), Stability::Ga);
+    }
+
+    /// The autoGa table every Sanshain client tests: (autoGa, stream declared,
+    /// GA flag, SANSHAIN_GA) and the stability it resolves to.
+    #[test]
+    fn auto_ga_makes_a_declared_stream_ga_unless_the_switch_is_set() {
+        let (trunk, tag, none) = (
+            Stream::resolve_with(true, None, None, None),
+            Stream::resolve_with(false, Some("release-1"), None, None),
+            Stream::resolve_with(false, None, None, None),
+        );
+        let declared = |(stream, warning): &(Stream, Option<&str>)| {
+            *stream != Stream::None || warning.is_some()
+        };
+        let both = Stream::resolve_with(true, Some("release-1"), None, None);
+        assert_eq!(both.0, Stream::None);
+        let cases = [
+            // autoGa, stream, ga flag, SANSHAIN_GA, expected
+            (true, &trunk, None, None, Stability::Ga),
+            (true, &tag, None, None, Stability::Ga),
+            (true, &none, None, None, Stability::Snapshot),
+            (true, &trunk, None, Some("false"), Stability::Snapshot),
+            (true, &trunk, Some(false), None, Stability::Snapshot),
+            (false, &trunk, None, None, Stability::Snapshot),
+            (false, &none, None, Some("true"), Stability::Ga),
+            (true, &none, Some(true), Some("false"), Stability::Ga),
+            // Both trunk and a tag send neither, but still declared a stream.
+            (true, &both, None, None, Stability::Ga),
+        ];
+        for (auto_ga, stream, flag, env, expected) in cases {
+            assert_eq!(
+                Stability::resolve_with(flag, env, auto_ga, declared(stream)),
+                expected,
+                "autoGa {auto_ga}, stream {:?}, flag {flag:?}, SANSHAIN_GA {env:?}",
+                stream.0
+            );
+        }
+    }
+
+    #[test]
+    fn a_blank_ga_variable_is_unset_and_any_other_value_decides() {
+        for blank in ["", " ", "\n"] {
+            assert_eq!(
+                Stability::resolve_with(None, Some(blank), true, true),
+                Stability::Ga,
+                "{blank:?}"
+            );
+        }
+        for off in ["no", "0", "FALSE"] {
+            assert_eq!(
+                Stability::resolve_with(None, Some(off), true, true),
+                Stability::Snapshot,
+                "{off:?}"
+            );
+        }
+        assert_eq!(
+            Stability::resolve_with(None, Some(" 1 "), false, false),
+            Stability::Ga
+        );
+    }
+
+    #[test]
+    fn auto_ga_defaults_off_and_loads_from_yaml() {
+        let plain = Config::from_yaml_str("serviceName: s\n").ok();
+        assert_eq!(plain.map(|c| c.auto_ga), Some(false));
+        let on = Config::from_yaml_str("serviceName: s\nautoGa: true\n").ok();
+        assert_eq!(on.as_ref().map(|c| c.auto_ga), Some(true));
+        assert_eq!(on.map(|c| c.unknown_fields), Some(Vec::new()));
+        match Config::from_yaml_str("serviceName: s\nautoGa: yes\n") {
+            Err(Error::Config(message)) => assert!(message.contains("invalid"), "{message}"),
+            other => panic!("expected a configuration error, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2910,6 +3381,22 @@ requires:
         }
     }
 
+    #[test]
+    fn an_empty_url_variable_counts_as_unset() {
+        for empty in ["", "  "] {
+            match resolve_url(Some("http://config.example/"), Some(empty)) {
+                Ok(url) => assert_eq!(url, "http://config.example"),
+                Err(err) => panic!("expected the configured URL, got {err}"),
+            }
+            match resolve_url(None, Some(empty)) {
+                Err(Error::Config(message)) => {
+                    assert!(message.contains("'sanshainUrl'"), "unexpected: {message}");
+                }
+                other => panic!("expected a configuration error, got {other:?}"),
+            }
+        }
+    }
+
     // --- 2.2: streams, retire, harvested subscriptions, version leniency ---
 
     #[test]
@@ -3057,6 +3544,39 @@ requires:
         );
         assert!(message.contains("releaser"), "unexpected: {message}");
         assert!(message.contains("snapshot"), "unexpected: {message}");
+        assert!(message.contains("autoGa off"), "unexpected: {message}");
+        assert!(
+            message.contains("SANSHAIN_GA=false"),
+            "unexpected: {message}"
+        );
+    }
+
+    const READ_ONLY_REFUSAL: &str = r#"{"error":"this API token has scope 'read_only' and may not change the catalog; create a token with scope 'full' for provide, require and catalog pushes"}"#;
+
+    #[test]
+    fn a_403_without_the_releaser_reason_shows_the_service_message_only() {
+        let message = provide_error_message(
+            403,
+            READ_ONLY_REFUSAL,
+            ApiType::OpenApi,
+            Path::new("openapi.yaml"),
+        );
+        assert_eq!(
+            message,
+            "provide refused (403): this API token has scope 'read_only' and may not change the catalog; create a token with scope 'full' for provide, require and catalog pushes"
+        );
+        let retire = retire_error_message(403, READ_ONLY_REFUSAL, "svc");
+        assert_eq!(
+            retire,
+            "retire refused (403): this API token has scope 'read_only' and may not change the catalog; create a token with scope 'full' for provide, require and catalog pushes"
+        );
+        let plain = provide_error_message(
+            403,
+            "Forbidden",
+            ApiType::OpenApi,
+            Path::new("openapi.yaml"),
+        );
+        assert_eq!(plain, "provide refused (403): Forbidden");
     }
 
     #[test]
@@ -3190,5 +3710,276 @@ requires:
             }
             other => panic!("expected a configuration error, got {other:?}"),
         }
+    }
+
+    // --- annotations ---
+
+    fn flags<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_string())
+        }
+    }
+
+    fn no_env(_: &str) -> Option<String> {
+        None
+    }
+
+    #[test]
+    fn a_flag_and_the_environment_fill_different_placeholders() {
+        let env = env_of(&[("SANSHAIN_SET_B", "2")]);
+        assert_eq!(
+            fill_placeholders("x-{{A}}-{{B}}", flags(&[("A", "1")]), env),
+            Ok("x-1-2".to_string())
+        );
+    }
+
+    #[test]
+    fn the_flag_beats_the_environment() {
+        let env = env_of(&[("SANSHAIN_SET_A", "e")]);
+        assert_eq!(
+            fill_placeholders("{{A}}", flags(&[("A", "f")]), env),
+            Ok("f".to_string())
+        );
+    }
+
+    #[test]
+    fn a_repeated_placeholder_is_filled_every_time() {
+        assert_eq!(
+            fill_placeholders("{{A}}/{{A}}", flags(&[("A", "7")]), no_env),
+            Ok("7/7".to_string())
+        );
+    }
+
+    #[test]
+    fn an_unset_placeholder_is_missing() {
+        assert_eq!(
+            fill_placeholders("{{MISSING}}", flags(&[]), no_env),
+            Err("MISSING".to_string())
+        );
+        // The first unfilled one is named.
+        assert_eq!(
+            fill_placeholders("{{A}}{{B}}{{C}}", flags(&[("A", "1")]), no_env),
+            Err("B".to_string())
+        );
+    }
+
+    #[test]
+    fn an_empty_value_is_unfilled_and_an_empty_flag_does_not_fall_through() {
+        assert_eq!(
+            fill_placeholders("{{A}}", flags(&[("A", "")]), no_env),
+            Err("A".to_string())
+        );
+        let env = env_of(&[("SANSHAIN_SET_A", "e")]);
+        assert_eq!(
+            fill_placeholders("{{A}}", flags(&[("A", "")]), env),
+            Err("A".to_string())
+        );
+        let empty_env = env_of(&[("SANSHAIN_SET_A", "")]);
+        assert_eq!(
+            fill_placeholders("{{A}}", flags(&[]), empty_env),
+            Err("A".to_string())
+        );
+    }
+
+    #[test]
+    fn the_environment_name_is_case_exact() {
+        let env = env_of(&[("SANSHAIN_SET_A", "x")]);
+        assert_eq!(
+            fill_placeholders("{{a}}", flags(&[]), env),
+            Err("a".to_string())
+        );
+    }
+
+    #[test]
+    fn a_plain_value_is_unchanged() {
+        assert_eq!(
+            fill_placeholders("plain value", flags(&[]), no_env),
+            Ok("plain value".to_string())
+        );
+    }
+
+    #[test]
+    fn braces_around_anything_but_a_name_are_literal() {
+        let set = [("A", "1"), ("a-b", "2"), (" A ", "3")];
+        for literal in ["{{ A }}", "{{a-b}}", "{{}}", "{{A", "{A}}", "}}{{", "{{ü}}"] {
+            assert_eq!(
+                fill_placeholders(literal, flags(&set), no_env),
+                Ok(literal.to_string()),
+                "{literal:?}"
+            );
+        }
+        // Like a regex search: the scan goes on from the second brace.
+        assert_eq!(
+            fill_placeholders("{{{A}}}", flags(&set), no_env),
+            Ok("{1}".to_string())
+        );
+    }
+
+    #[test]
+    fn a_value_with_an_equals_sign_stays_whole() {
+        // `--set A=x=y` splits at the first `=`, so A is "x=y".
+        let sets = [("A".to_string(), "x=y".to_string())];
+        let declared = [Annotation {
+            scope: AnnotationScope::System,
+            name: "a".to_string(),
+            value: "{{A}}".to_string(),
+        }];
+        let filled = fill_annotations_with(&declared, &sets, no_env);
+        assert_eq!(filled.annotations[0].value, "x=y");
+    }
+
+    fn example_annotations() -> Vec<Annotation> {
+        vec![
+            Annotation {
+                scope: AnnotationScope::Version,
+                name: "requirements".to_string(),
+                value: "http://solar.system/id-{{AREA}}/requirements/{{ID}}".to_string(),
+            },
+            Annotation {
+                scope: AnnotationScope::System,
+                name: "jenkins".to_string(),
+                value: "https://jenkins.corp/job/payments".to_string(),
+            },
+        ]
+    }
+
+    #[test]
+    fn an_unfilled_entry_is_left_out_with_a_warning_and_the_others_are_kept() {
+        let sets = [("AREA".to_string(), "7".to_string())];
+        let filled = fill_annotations_with(&example_annotations(), &sets, no_env);
+        assert_eq!(
+            filled.warnings,
+            vec![
+                "annotation 'requirements' left out: {{ID}} is not set (--set ID=… or SANSHAIN_SET_ID)"
+                    .to_string()
+            ]
+        );
+        assert_eq!(filled.annotations, vec![example_annotations()[1].clone()]);
+    }
+
+    #[test]
+    fn filled_entries_keep_scope_name_and_order_and_the_last_set_wins() {
+        let sets = [
+            ("AREA".to_string(), "1".to_string()),
+            ("AREA".to_string(), "7".to_string()),
+        ];
+        let env = env_of(&[("SANSHAIN_SET_ID", "42")]);
+        let filled = fill_annotations_with(&example_annotations(), &sets, env);
+        assert!(filled.warnings.is_empty(), "{:?}", filled.warnings);
+        assert_eq!(filled.annotations.len(), 2);
+        assert_eq!(filled.annotations[0].scope, AnnotationScope::Version);
+        assert_eq!(filled.annotations[0].name, "requirements");
+        assert_eq!(
+            filled.annotations[0].value,
+            "http://solar.system/id-7/requirements/42"
+        );
+        assert_eq!(filled.annotations[1], example_annotations()[1]);
+    }
+
+    #[test]
+    fn annotations_load_from_yaml_in_file_order() {
+        let config = Config::from_yaml_str(
+            r#"
+serviceName: s
+annotations:
+  - scope: version
+    name: requirements
+    value: "http://solar.system/id-{{AREA}}/requirements/{{ID}}"
+  - scope: system
+    name: jenkins
+    value: "https://jenkins.corp/job/payments"
+"#,
+        );
+        match config {
+            Ok(config) => {
+                assert_eq!(config.annotations, example_annotations());
+                assert!(
+                    config.unknown_fields.is_empty(),
+                    "{:?}",
+                    config.unknown_fields
+                );
+            }
+            Err(err) => panic!("expected valid config, got {err}"),
+        }
+        let none = Config::from_yaml_str("serviceName: s\n").ok();
+        assert_eq!(none.map(|c| c.annotations), Some(Vec::new()));
+        let empty = Config::from_yaml_str("serviceName: s\nannotations:\n").ok();
+        assert_eq!(empty.map(|c| c.annotations), Some(Vec::new()));
+    }
+
+    fn annotations_error(entries: &str) -> String {
+        match Config::from_yaml_str(&format!("serviceName: s\nannotations:{entries}")) {
+            Err(Error::Config(message)) => message,
+            other => panic!("expected a configuration error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_malformed_annotation_is_a_configuration_error_naming_the_entry() {
+        let cases = [
+            (
+                "\n  - scope: system\n    name: jenkins\n",
+                "annotations[0] (jenkins): missing 'value'",
+            ),
+            (
+                "\n  - scope: system\n    value: x\n",
+                "annotations[0]: missing 'name'",
+            ),
+            (
+                "\n  - scope: system\n    name: a\n    value: x\n  - name: b\n    value: y\n",
+                "annotations[1] (b): missing 'scope'",
+            ),
+            (
+                "\n  - scope: system\n    name: build\n    value: 42\n",
+                "annotations[0] (build): 'value' must be a string",
+            ),
+            (
+                "\n  - scope: system\n    name: flag\n    value: true\n",
+                "annotations[0] (flag): 'value' must be a string",
+            ),
+            (
+                "\n  - scope: product\n    name: a\n    value: x\n",
+                "annotations[0] (a): scope 'product' is not supported — use version or system",
+            ),
+            (
+                " jenkins\n",
+                "annotations: must be a list of entries with scope, name and value",
+            ),
+            (
+                "\n  - jenkins\n",
+                "annotations[0]: must be an entry with scope, name and value",
+            ),
+        ];
+        for (entries, expected) in cases {
+            assert_eq!(annotations_error(entries), expected, "{entries:?}");
+        }
+    }
+
+    #[test]
+    fn an_extra_key_in_an_annotation_is_an_unknown_field() {
+        let fields = unknown(
+            "serviceName: s\nannotations:\n  - scope: system\n    name: a\n    value: x\n    label: y\n",
+        );
+        assert_eq!(fields, vec!["annotations[0].label".to_string()]);
+    }
+
+    #[test]
+    fn only_the_exact_unknown_field_text_means_annotations_are_refused() {
+        assert!(annotations_field_refused(
+            "Failed to deserialize the JSON body into the target type: unknown field `annotations`, expected one of `producername`, `openapi_yaml`, `stability`"
+        ));
+        assert!(annotations_field_refused(
+            "Failed to deserialize query string: unknown field `annotations`, expected one of `consumername`, `producername`"
+        ));
+        // A 2.13 service refusing something else lists `annotations` as expected.
+        assert!(!annotations_field_refused(
+            "Failed to deserialize the JSON body into the target type: unknown field `colour`, expected one of `producername`, `annotations`, `build_url`"
+        ));
+        assert!(!origin_field_refused(
+            "Failed to deserialize the JSON body into the target type: unknown field `annotations`, expected one of `producername`, `build_url`, `change_url`, `tickets`, `note`"
+        ));
     }
 }
