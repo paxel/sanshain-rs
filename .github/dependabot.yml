@@ -1,0 +1,27 @@
+# Dependency updates: one grouped pull request per ecosystem and week.
+# A release is proposed only after it has been out for 14 days (cooldown),
+# so early fixes are in; security updates are not held back.
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 14
+    groups:
+      cargo:
+        patterns: ["*"]
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 14
+    groups:
+      githubactions:
+        patterns: ["*"]
+    # The Rust toolchain pin is bumped on purpose, together with
+    # rust-toolchain.toml or the MSRV, never by a weekly update.
+    ignore:
+      - dependency-name: "dtolnay/rust-toolchain"

@@ -25,6 +25,10 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
+# The token only reads the code: no job writes to the repository.
+permissions:
+  contents: read
+
 jobs:
   gate:
     name: Gate (fmt, clippy, tests)
