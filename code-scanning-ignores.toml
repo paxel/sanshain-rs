@@ -1,0 +1,15 @@
+# Accepted findings. The release and the weekly Security run (paxel/gates release-gate.yml)
+# fail on every open code-scanning alert, of any tool and severity, every open
+# secret-scanning alert, and every open SonarQube Cloud issue and hotspot to review that is not
+# listed here. Each entry says why the finding stays and
+# when the gate fails again: that is the review. Then fix it, or move the date with a reason.
+# Nothing is dismissed in GitHub or marked in SonarQube Cloud.
+#
+# [[IgnoredAlerts]]   tool, rule (as GitHub reports them), path, reason, ignoreUntil
+#                     path is the file the finding is in; the entry covers that file only.
+#                     Leave it out only for a finding without a file (Scorecard's
+#                     repository-level ones); left out for a finding in a file, it blocks.
+#                     A SonarQube Cloud finding has tool = "SonarQube Cloud" and the rule
+#                     as SonarQube Cloud writes it, e.g. "pythonsecurity:S8707".
+# [[IgnoredSecrets]]  secret_type, reason, ignoreUntil
+

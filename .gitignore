@@ -1,1 +1,3 @@
 /target
+# Coverage reports of the local runs and of CI; the floors and the badge are committed.
+/coverage
