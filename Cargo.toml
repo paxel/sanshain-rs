@@ -23,6 +23,9 @@ repository = "https://github.com/paxel/sanshain-rs"
 [workspace.lints.rust]
 # Forbidden rather than denied: neither crate has any `unsafe`.
 unsafe_code = "forbid"
+# cargo-fuzz builds with `--cfg fuzzing`; the library shows the fuzz targets in fuzz/ what
+# they need only then. Declared, so that a normal build knows the name and stays silent.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
 
 [workspace.lints.clippy]
 # Shipped code may not panic: no unwrap, expect or panic, no unreachable, no indexing or

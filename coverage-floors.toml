@@ -6,4 +6,4 @@
 [[parts]]
 name = "rust"
 lcov = "coverage/rust.lcov"
-floor = 93.77
+floor = 93.78
