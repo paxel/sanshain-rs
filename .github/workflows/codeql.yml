@@ -1,46 +1,23 @@
-# CodeQL code scanning, advanced setup so it is versioned here: the library and
-# the CLI (Rust) and the workflows themselves, on every push and pull request
-# and weekly, because new queries appear without any change in this repo. The
-# alerts show under Security ▸ Code scanning. Settings ▸ Code security ▸ Code
-# scanning ▸ Default setup stays off: it cannot run beside this workflow.
-#
-# Third-party actions are pinned to full commit SHAs; the comment names the
-# version.
 name: CodeQL
 
+# CodeQL on every push, pull request and weekly, from paxel/gates. languages lists what CodeQL
+# can analyse here (rust, python, javascript-typescript, java-kotlin, go); the workflows are
+# always analysed. CodeQL has no Dart: a Dart repository keeps '[]'.
 on:
   push:
-    branches: ["**"]
+    branches: [summer]
   pull_request:
   schedule:
-    - cron: "41 4 * * 1"
+    - cron: "47 4 * * 1"
 
 permissions:
   contents: read
 
 jobs:
-  analyze:
-    name: Analyze (${{ matrix.language }})
-    runs-on: ubuntu-latest
+  codeql:
+    uses: paxel/gates/.github/workflows/codeql.yml@e5e253a7caff277f039fb31a3e6be1479682dcc4 # v1.2.0
     permissions:
       contents: read
       security-events: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - language: rust
-            build-mode: none
-          - language: actions
-            build-mode: none
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
-        with:
-          languages: ${{ matrix.language }}
-          build-mode: ${{ matrix.build-mode }}
-
-      - uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
-        with:
-          category: /language:${{ matrix.language }}
+    with:
+      languages: '["rust"]'
