@@ -59,15 +59,7 @@ jobs:
       - name: Tests
         run: cargo +1.89 test --workspace --locked
 
-  # The same audit as the weekly Security workflow, with the same job name, so a
-  # pull request that brings in a vulnerable crate is stopped before the merge.
-  cargo-audit:
-    name: Vulnerable crates (cargo audit)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
-        with:
-          tool: cargo-audit
-      - name: cargo audit
-        run: cargo audit
+  # Known vulnerabilities and licences of every dependency, from paxel/gates: osv-scanner
+  # decided by gates' osv_gate.py. What is accepted stands in osv-scanner.toml.
+  vulns:
+    uses: paxel/gates/.github/workflows/vulns.yml@e5e253a7caff277f039fb31a3e6be1479682dcc4 # v1.2.0
