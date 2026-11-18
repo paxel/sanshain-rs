@@ -5,25 +5,10 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 
-## [4.0.0]
+## [4.0.1]
 
 ### Added
-- `autoGa: true` in `sanshain.yaml` makes a provide GA whenever the build declares trunk or a tag; `SANSHAIN_GA=false` keeps a build a snapshot. The library resolves it with `Stability::resolve` and exposes it as `Config::auto_ga`.
-- `annotations` in `sanshain.yaml` travel with provide, require, bundle and catalog push, their `{{NAME}}` placeholders filled from `--set NAME=value` or `SANSHAIN_SET_NAME` (needs Sanshain Service 2.13.0 or later); the library offers `fill_annotations` and `Client::with_annotations`.
-
-### Breaking Changes
-- Library: `Config` has new public fields (`auto_ga`, `annotations`), so code that builds a `Config` must be adapted.
-
-### Changed
-- A missing or broken `sanshain.yaml` (unreadable, invalid YAML, 1.x fields, failed validation) under `--best-effort` or `SANSHAIN_BEST_EFFORT` prints the error, then `Continuing (best effort)`, and exits 0, now without the `Warning loading config:` prefix. `SANSHAIN_STRICT=true` makes it fail also with best effort, and under best effort a file that does not validate no longer fails over unknown fields because of its own `strict: true`; its own `bestEffort` still does not count. Without best effort a missing file fails, naming it, as before.
-
-### Fixed
-- `apiType: grpc` is read as `proto` on provides and requires, as the other clients read it: a require goes to `/require/grpc` and is saved as `.proto`; the spelling was refused as an invalid `sanshain.yaml`.
-- Best effort works the same in provide, require and catalog: a missing URL fails under strict also with best effort, and a failed provide no longer stops the next `provides` entry.
-- A `403` on provide or retire names the releaser role only when the service refused for want of it; any other `403`, such as a read-only token's, shows the service's message alone.
-- An empty `SANSHAIN_URL` counts as unset, so `sanshainUrl` from `sanshain.yaml` is used; it hid the configured URL and failed with "missing 'sanshainUrl'".
-- The library's crate docs say 4.x and name `sanshain.yaml` as the configuration source; they said 2.x and `[package.metadata.sanshain]`.
-- The release, CI and security workflows pin every action to a full commit SHA; they referenced tags and branches.
+- The release on GitHub carries both crates as `.crate` files, the files crates.io holds, with a CycloneDX SBOM of the source, a build provenance attestation and its Sigstore bundle; `gh attestation verify <file> -R paxel/sanshain-rs` checks a download ([sanrs-1005](https://github.com/paxel/sanshain-rs/issues/14)). The library and the subcommand behave as in 4.0.0.
 
 ---
 
