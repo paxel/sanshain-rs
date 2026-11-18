@@ -17,3 +17,27 @@ rust-version = "1.89"
 authors = ["Patrick Zimmer"]
 license = "Apache-2.0"
 repository = "https://github.com/paxel/sanshain-rs"
+
+# The lint set of the standard (paxel/gates, configs/rust/lints.toml), for every target of
+# both crates; each takes it with `[lints] workspace = true`.
+[workspace.lints.rust]
+# Forbidden rather than denied: neither crate has any `unsafe`.
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# Shipped code may not panic: no unwrap, expect or panic, no unreachable, no indexing or
+# slicing that can go out of bounds, no arithmetic that can overflow. CI runs clippy on the
+# tests with these seven allowed (paxel/gates, actions/rust): they are how a test fails.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+indexing_slicing = "deny"
+string_slice = "deny"
+arithmetic_side_effects = "deny"
+todo = "deny"
+unimplemented = "deny"
+# No `dbg!`, and no `#[allow]`: a lint that must be silenced says so with an
+# `#[expect(..., reason = "...")]`, which fails once the lint no longer fires.
+dbg_macro = "deny"
+allow_attributes = "deny"
