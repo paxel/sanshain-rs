@@ -53,7 +53,7 @@ jobs:
 
   gate:
     needs: version
-    uses: paxel/gates/.github/workflows/release-gate.yml@66ed2d3a448a5f6bfa1794809b330eb9fbee01ba # v1.2.0
+    uses: paxel/gates/.github/workflows/release-gate.yml@02a81ad45b815cbed94f9bb6841424a624e8155f # v1.2.0
     permissions:
       contents: read
       security-events: read
@@ -126,7 +126,7 @@ jobs:
 
   provenance:
     needs: package
-    uses: paxel/gates/.github/workflows/provenance.yml@66ed2d3a448a5f6bfa1794809b330eb9fbee01ba # v1.2.0
+    uses: paxel/gates/.github/workflows/provenance.yml@02a81ad45b815cbed94f9bb6841424a624e8155f # v1.2.0
     permissions:
       contents: read
       id-token: write

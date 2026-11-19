@@ -24,12 +24,12 @@ jobs:
   # Known vulnerabilities and licences of every dependency: osv-scanner decided by gates'
   # osv_gate.py. What is accepted stands in osv-scanner.toml.
   vulns:
-    uses: paxel/gates/.github/workflows/vulns.yml@66ed2d3a448a5f6bfa1794809b330eb9fbee01ba # v1.2.0
+    uses: paxel/gates/.github/workflows/vulns.yml@02a81ad45b815cbed94f9bb6841424a624e8155f # v1.2.0
 
   # On the Rust release rust-toolchain.toml pins. Linux only: the release ships source, as
   # crates, and no binary for any system.
   rust:
-    uses: paxel/gates/.github/workflows/rust.yml@66ed2d3a448a5f6bfa1794809b330eb9fbee01ba # v1.2.0
+    uses: paxel/gates/.github/workflows/rust.yml@02a81ad45b815cbed94f9bb6841424a624e8155f # v1.2.0
 
   # The README promises this floor, so it is built and tested, not just declared.
   # Keep in sync with `rust-version` in the workspace Cargo.toml.
@@ -48,6 +48,6 @@ jobs:
 
   sonar:
     needs: rust
-    uses: paxel/gates/.github/workflows/sonar.yml@66ed2d3a448a5f6bfa1794809b330eb9fbee01ba # v1.2.0
+    uses: paxel/gates/.github/workflows/sonar.yml@02a81ad45b815cbed94f9bb6841424a624e8155f # v1.2.0
     secrets:
       sonar-token: ${{ secrets.SQ_TOKEN }}
