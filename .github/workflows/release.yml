@@ -1,44 +1,80 @@
-# Release on tag: `git tag v2.0.0 && git push origin v2.0.0` produces everything.
+# Release on tag: `git tag v4.0.1 && git push origin v4.0.1` produces everything.
 #
-#   gate            — the full gate once more, plus tag/version agreement
-#   release         — the GitHub Release
-#   publish-crates  — crates.io, library before subcommand
+#   gate            - paxel/gates release-gate.yml: no open alert or SonarQube Cloud finding
+#                     that is not accepted, no known vulnerability, no licence outside the
+#                     allowlist, and a CHANGELOG section for the version
+#   test            - tag matches the workspace version, then format, clippy and every test
+#                     on the tagged commit
+#   package         - both crates as .crate files, the files crates.io will hold
+#   provenance      - paxel/gates provenance.yml: a CycloneDX SBOM of the source, signed build
+#                     provenance for every file and its Sigstore bundle as a file of its own
+#   release         - GitHub Release, notes = the CHANGELOG section for the tag, with every
+#                     file of the jobs before
+#   publish-crates  - crates.io, library before subcommand, each only when it is byte for
+#                     byte the attested file
 #
 # `cargo-sanshain` is a cargo subcommand, so anyone who can run it already has
 # cargo: crates.io is the whole distribution story and there are no prebuilt
 # binaries, taps or buckets to maintain.
 #
-# One-time setup (repository secret):
-#   CARGO_REGISTRY_TOKEN — crates.io API token with publish scope
+# One-time setup (repository secrets):
+#   CARGO_REGISTRY_TOKEN - crates.io API token with publish scope
+#   GATES_ALERTS_TOKEN   - read access to the repository's alerts, for the release gate
 name: Release
 
 on:
   push:
     tags: ["v*"]
-  # Releasing from the Actions UI: Run workflow → type the tag. RELEASE_TAG
-  # resolves to the typed tag or the pushed one, and the same pipeline runs
-  # either way.
+  # A manual re-run for a tag that already exists: the way back when a release job fails
+  # for a reason that has since been fixed, for example between the two crates.io uploads,
+  # without moving or burning a tag.
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (e.g. v2.1.0)"
+        description: "Release tag (e.g. v4.0.1)"
         required: true
 
 env:
   CARGO_TERM_COLOR: always
   RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
 
-# Read-only by default; only the job that creates the GitHub release gets more.
+# Least privilege: the job that writes the GitHub Release widens this itself.
 permissions:
   contents: read
 
 jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - id: v
+        run: echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
+
   gate:
-    name: Gate
-    runs-on: ubuntu-latest
+    needs: version
+    uses: paxel/gates/.github/workflows/release-gate.yml@02a81ad45b815cbed94f9bb6841424a624e8155f # v1.2.0
+    permissions:
+      contents: read
+      security-events: read
+    with:
+      version: ${{ needs.version.outputs.version }}
+    secrets:
+      alerts-token: ${{ secrets.GATES_ALERTS_TOKEN }}
+
+  # The shared gate runs no tests. A tag can sit on any commit, and a version on crates.io
+  # cannot be replaced, so the tagged commit is tested here once more before anything is
+  # packaged from it (docs/adr/0001-move-to-gates.md).
+  test:
+    name: Tests on the tagged commit
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
+      # Keep in sync with rust-toolchain.toml; toolchain bumps are deliberate, separate commits.
+      - uses: dtolnay/rust-toolchain@9522411a9bce8484da960823fc2f46e52f981f71 # 1.100.0 branch
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -50,45 +86,130 @@ jobs:
           ver=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
           tag=${RELEASE_TAG#v}
           [ "$ver" = "$tag" ] || { echo "tag v$tag != workspace version $ver" >&2; exit 1; }
-      - run: cargo fmt --check
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo test --workspace --locked
+      - run: cargo fmt --all -- --check
+      # The two clippy runs of the shared Rust gate: shipped code under the whole lint set,
+      # tests with the lints allowed that are how a test fails.
+      - name: Clippy on shipped code
+        run: cargo clippy --locked --all-features -- -D warnings
+      - name: Clippy on tests
+        run: >-
+          cargo clippy --locked --tests --benches --examples --all-features -- -D warnings
+          -A clippy::unwrap_used -A clippy::expect_used -A clippy::panic -A clippy::indexing_slicing
+          -A clippy::string_slice -A clippy::arithmetic_side_effects -A clippy::unreachable
+      - run: cargo test --locked --all-features
+
+  package:
+    name: Crates
+    needs: [gate, test]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@9522411a9bce8484da960823fc2f46e52f981f71 # 1.100.0 branch
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # Both at once: cargo-sanshain needs the sanshain of this version, which is not on
+      # crates.io yet, and cargo then builds it against the library packaged beside it.
+      - name: Package and verify both crates
+        run: cargo package --workspace --locked
+      - name: The release files
+        run: |
+          ver=${RELEASE_TAG#v}
+          mkdir -p dist
+          cp "target/package/sanshain-${ver}.crate" "target/package/cargo-sanshain-${ver}.crate" dist/
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-crates
+          path: dist/*
+          if-no-files-found: error
+
+  provenance:
+    needs: package
+    uses: paxel/gates/.github/workflows/provenance.yml@02a81ad45b815cbed94f9bb6841424a624e8155f # v1.2.0
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    with:
+      name: sanshain-rs
+      tag: ${{ github.event.inputs.tag || github.ref_name }}
+      artifacts: dist-*
 
   release:
     name: GitHub Release
-    needs: gate
-    runs-on: ubuntu-latest
+    needs: provenance
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
+      # Both crates, with the SBOM and the Sigstore bundle beside them:
+      # `gh attestation verify <file> -R paxel/sanshain-rs` checks a download, with
+      # `--bundle <the sigstore file>` offline.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-files
+          path: dist
+      - name: Release notes from the CHANGELOG section
+        run: |
+          ver=${RELEASE_TAG#v}
+          awk -v ver="$ver" '
+            $0 ~ "^## \\[" ver "\\]" { grab = 1; next }
+            grab && (/^## \[/ || /^---/) { exit }
+            grab { print }
+          ' CHANGELOG.md > notes.md
+          [ -s notes.md ] || { echo "::error::CHANGELOG.md has no section for $ver" >&2; exit 1; }
+      # softprops updates an existing release rather than failing on it, so a re-run for
+      # the same tag is safe.
+      - name: Create or update the release
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
           tag_name: ${{ env.RELEASE_TAG }}
-          body_path: CHANGELOG.md
+          body_path: notes.md
+          files: dist/*
+          fail_on_unmatched_files: true
 
   publish-crates:
-    name: crates.io (sanshain → cargo-sanshain)
+    name: crates.io (sanshain, then cargo-sanshain)
     needs: release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@9522411a9bce8484da960823fc2f46e52f981f71 # 1.100.0 branch
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-files
+          path: attested
       - name: Publish in dependency order (skipping versions already on the index)
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           ver=${RELEASE_TAG#v}
           publish() {
-            # A crates.io version is immutable — republishing is a hard error,
+            # A crates.io version is immutable: republishing is a hard error,
             # so a re-run after a partial publish must skip what already landed.
             # Cargo waits for the index itself, so no sleep is needed between.
             if curl -fsSL --proto '=https' -A "sanshain-rs-release-workflow" \
                  "https://crates.io/api/v1/crates/$1/${ver}" >/dev/null 2>&1; then
-              echo "$1 ${ver} already on crates.io — skipping"
-            else
-              cargo publish --locked -p "$1"
+              echo "$1 ${ver} already on crates.io, skipping"
+              return
             fi
+            # cargo cannot upload a file it did not package itself. Packaging is
+            # reproducible, so what it is about to upload is packaged first and compared
+            # with the attested file: a difference stops the upload.
+            cargo package --locked --no-verify -p "$1"
+            cmp "target/package/$1-${ver}.crate" "attested/$1-${ver}.crate" || {
+              echo "::error::$1-${ver}.crate differs from the attested release file" >&2
+              exit 1
+            }
+            cargo publish --locked -p "$1"
           }
           publish sanshain
           publish cargo-sanshain

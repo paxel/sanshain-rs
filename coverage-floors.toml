@@ -1,0 +1,9 @@
+# The coverage ratchet (paxel/gates coverage_ratchet.py): one part per measured package. CI
+# writes coverage/rust.lcov and fails below the floor. After a rise, run the two commands
+# AGENTS.md names; the ratchet raises the floor to the measured value minus 0.1 and writes
+# .github/badges/coverage-rust.json. Commit both with the change that earned them.
+
+[[parts]]
+name = "rust"
+lcov = "coverage/rust.lcov"
+floor = 93.78

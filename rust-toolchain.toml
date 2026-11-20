@@ -1,0 +1,6 @@
+# The exact Rust release every build uses, locally and in CI. The release workflow pins
+# dtolnay/rust-toolchain to the same version; a bump changes both in a commit of its own.
+# The oldest Rust the crates support is `rust-version` in Cargo.toml, which CI tests apart.
+[toolchain]
+channel = "1.100.0"
+components = ["clippy", "rustfmt"]

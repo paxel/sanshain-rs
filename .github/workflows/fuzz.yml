@@ -1,0 +1,27 @@
+name: Fuzz
+
+# The fuzz targets in fuzz/ (cargo-fuzz, libFuzzer), weekly and by hand, from paxel/gates: what
+# the client reads but did not write. config is sanshain.yaml, annotations is the filling of
+# the placeholders in annotation values, response is the body and the warning headers of a
+# failed call. A crash fails the job; `cargo fuzz run <target> <file>` replays its input.
+#
+# cargo-fuzz needs nightly compiler flags. The shared workflow gives them to the pinned stable
+# toolchain through RUSTC_BOOTSTRAP=1, so the code is fuzzed with the compiler that builds the
+# release.
+on:
+  schedule:
+    - cron: "29 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    uses: paxel/gates/.github/workflows/fuzz.yml@02a81ad45b815cbed94f9bb6841424a624e8155f # v1.2.0
+    with:
+      stack: rust
+      targets: |
+        config
+        annotations
+        response

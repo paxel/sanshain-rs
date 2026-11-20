@@ -1,25 +1,24 @@
-# Fails only when a dependency has a known vulnerability (RustSec advisories). Runs weekly and
-# on demand, because new advisories appear without any change in this repo.
-# The same audit also runs in CI on every push and pull request (ci.yml, same job name).
-# Warnings such as unmaintained or yanked packages are reported but never fail it.
 name: Security
 
+# Weekly, and by hand: the release gate without a version, strict. It fails on every open
+# code-scanning or secret-scanning alert that code-scanning-ignores.toml does not accept, on a
+# known vulnerability, on an unmaintained dependency and on a licence outside the allowlist,
+# and when an accepted finding's date has passed: that is the review.
 on:
   schedule:
-    - cron: "17 5 * * 1"
+    - cron: "23 5 * * 1"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  cargo-audit:
-    name: Vulnerable crates (cargo audit)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
-        with:
-          tool: cargo-audit
-      - name: cargo audit
-        run: cargo audit
+  gate:
+    uses: paxel/gates/.github/workflows/release-gate.yml@02a81ad45b815cbed94f9bb6841424a624e8155f # v1.2.0
+    permissions:
+      contents: read
+      security-events: read
+    with:
+      strict: true
+    secrets:
+      alerts-token: ${{ secrets.GATES_ALERTS_TOKEN }}

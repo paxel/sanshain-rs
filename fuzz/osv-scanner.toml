@@ -1,0 +1,22 @@
+# osv-scanner's exceptions for fuzz/Cargo.lock: osv-scanner reads the file beside the
+# lockfile, so the fuzz crate cannot share the one at the repository root. The rules are the
+# same: a reason, a date, and the gate fails again when the date passes.
+
+[[PackageOverrides]]
+name = "libfuzzer-sys"
+ecosystem = "crates.io"
+license.ignore = true
+effectiveUntil = 2027-02-18
+reason = """libfuzzer-sys carries LLVM's libFuzzer, which is under the University of \
+Illinois/NCSA Open Source License, a permissive licence of the MIT and BSD kind. It is linked \
+only into the fuzz targets, which run in CI and are never published; cargo-fuzz has no other \
+engine, and no release of libfuzzer-sys carries another licence."""
+
+[[PackageOverrides]]
+name = "webpki-roots"
+ecosystem = "crates.io"
+license.ignore = true
+effectiveUntil = 2027-02-18
+reason = """The same package and the same reason as in the osv-scanner.toml at the repository \
+root: Mozilla's list of root certificates under CDLA-Permissive-2.0, a permissive licence for \
+data, which the library's TLS setup (ureq with rustls) brings in."""

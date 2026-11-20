@@ -1,0 +1,38 @@
+# cargo-fuzz targets, run weekly by .github/workflows/fuzz.yml. A crate of its own,
+# outside the main workspace, so neither published crate ever depends on libFuzzer.
+[package]
+name = "sanshain-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+sanshain = { path = "../sanshain" }
+
+[[bin]]
+name = "config"
+path = "fuzz_targets/config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "annotations"
+path = "fuzz_targets/annotations.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "response"
+path = "fuzz_targets/response.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

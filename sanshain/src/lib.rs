@@ -16,26 +16,6 @@
 //! `autoGa: true` on a build that declares trunk or a tag (see
 //! [`Stability::resolve`]).
 
-// Shipped code may not use `unsafe` and may not panic: no unwrap, expect or
-// panic or unreachable, no indexing or slicing that can go out of bounds, no
-// arithmetic that can overflow. Unit tests are exempt via `cfg(test)`; integration tests are
-// separate crates.
-#![forbid(unsafe_code)]
-#![cfg_attr(
-    not(test),
-    deny(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::todo,
-        clippy::unimplemented,
-        clippy::unreachable,
-        clippy::indexing_slicing,
-        clippy::string_slice,
-        clippy::arithmetic_side_effects
-    )
-)]
-
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::fs;
@@ -1916,6 +1896,66 @@ fn agent() -> ureq::Agent {
         .into()
 }
 
+/// Every [`WARNING_HEADER`] value among `headers` that is text, in order. A
+/// value that is not text is left out.
+fn warning_lines(headers: &ureq::http::HeaderMap) -> Vec<String> {
+    headers
+        .get_all(WARNING_HEADER)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .map(str::to_string)
+        .collect()
+}
+
+/// What the `response` fuzz target in `fuzz/` calls. Compiled only with
+/// `--cfg fuzzing`, which cargo-fuzz sets: a normal build has no such module,
+/// so it is no part of the public API.
+#[cfg(fuzzing)]
+pub mod fuzzing {
+    use super::{
+        ApiType, RequireEntry, WARNING_HEADER, annotations_field_refused, catalog_error_message,
+        origin_field_refused, provide_error_message, require_error_message, retire_error_message,
+    };
+    use std::path::{Path, PathBuf};
+    use ureq::http::{HeaderMap, HeaderName, HeaderValue};
+
+    /// What every call makes of a failure with this status and body: the four
+    /// error messages, and whether the body refuses a field by name.
+    pub fn error_messages(status: u16, body: &str) -> Vec<String> {
+        let entry = RequireEntry {
+            service_name: "producer".to_string(),
+            api_type: ApiType::OpenApi,
+            version: "1.0.0".to_string(),
+            output_directory: PathBuf::from("generated"),
+            endpoints: Vec::new(),
+            format: None,
+        };
+        let _ = annotations_field_refused(body);
+        let _ = origin_field_refused(body);
+        vec![
+            provide_error_message(status, body, ApiType::OpenApi, Path::new("openapi.yaml")),
+            retire_error_message(status, body, "producer"),
+            require_error_message(status, body, &entry, "http://sanshain"),
+            catalog_error_message(status, body, None),
+        ]
+    }
+
+    /// The warnings kept from a response whose [`WARNING_HEADER`] headers
+    /// carry these raw values. A value no header can carry is left out, as
+    /// the HTTP parser would refuse the response.
+    pub fn warning_lines(values: &[&[u8]]) -> Vec<String> {
+        let mut headers = HeaderMap::new();
+        if let Ok(name) = HeaderName::from_bytes(WARNING_HEADER.as_bytes()) {
+            for value in values {
+                if let Ok(value) = HeaderValue::from_bytes(value) {
+                    headers.append(name.clone(), value);
+                }
+            }
+        }
+        super::warning_lines(&headers)
+    }
+}
+
 impl Client {
     /// Creates a client for the given base URL; `token` is sent as
     /// `Authorization: Bearer` when present. The stream defaults to
@@ -2045,14 +2085,8 @@ impl Client {
 
     /// Keeps the response's warnings — read before the body consumes it.
     fn record_warnings(&self, response: &Response) {
-        let mut found = response
-            .headers()
-            .get_all(WARNING_HEADER)
-            .iter()
-            .filter_map(|value| value.to_str().ok())
-            .map(str::to_string)
-            .peekable();
-        if found.peek().is_some() {
+        let found = warning_lines(response.headers());
+        if !found.is_empty() {
             self.lock_warnings().extend(found);
         }
     }
@@ -2301,6 +2335,24 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn warning_lines_keep_the_text_values_of_the_warning_header_in_order() {
+        use ureq::http::{HeaderMap, HeaderName, HeaderValue};
+        let name = HeaderName::from_bytes(WARNING_HEADER.as_bytes()).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.append(name.clone(), HeaderValue::from_static("first"));
+        // Bytes above ASCII are a legal header value, but no text.
+        headers.append(name.clone(), HeaderValue::from_bytes(b"caf\xe9").unwrap());
+        headers.append(name, HeaderValue::from_static("second, with a comma"));
+        headers.append("content-type", HeaderValue::from_static("text/plain"));
+
+        assert_eq!(
+            warning_lines(&headers),
+            vec!["first", "second, with a comma"]
+        );
+        assert!(warning_lines(&HeaderMap::new()).is_empty());
+    }
 
     fn valid_config_value() -> Value {
         json!({

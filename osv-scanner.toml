@@ -1,0 +1,31 @@
+# osv-scanner's exceptions, read by the OSV gate (paxel/gates vulns.yml). Each one says why
+# the repository is not exposed and why no update removes it, and carries a date; when the
+# date passes, the gate fails again: that is the review.
+#
+# An advisory:
+# [[IgnoredVulns]]
+# id = "RUSTSEC-2026-0000"
+# ignoreUntil = 2027-05-14
+# reason = "..."
+#
+# A licence outside the standard's allowlist (one package):
+# [[PackageOverrides]]
+# name = "some-crate"
+# ecosystem = "crates.io"
+# license.ignore = true
+# effectiveUntil = 2027-05-14
+# reason = "..."
+#
+# CI and the release list a notice that a crate is unmaintained without failing; the weekly
+# Security run fails on it.
+
+[[PackageOverrides]]
+name = "webpki-roots"
+ecosystem = "crates.io"
+license.ignore = true
+effectiveUntil = 2027-02-18
+reason = """webpki-roots is Mozilla's list of root certificates, published under \
+CDLA-Permissive-2.0, a permissive licence for data that asks only for the licence text to \
+travel with the data. It comes through ureq's default TLS setup (rustls), which checks the \
+service's certificate against that list. No release of webpki-roots carries another licence; \
+leaving it out would mean another TLS setup for every user of the library."""

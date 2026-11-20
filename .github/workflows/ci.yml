@@ -1,72 +1,53 @@
-# Gate for every push and pull request: formatting, clippy with zero warnings,
-# and the whole workspace test suite.
-#
-# Built against `stable` rather than a pinned toolchain, deliberately: this is a
-# published library, so the useful signal is whether it still compiles for the
-# toolchain consumers actually run. The floor consumers may rely on is the
-# `rust-version` in the workspace manifest; the msrv job tests it.
 name: CI
 
-# Push covers the working branches; pull_request covers forks. A push that also
-# belongs to an open same-repo PR would run twice — the concurrency group below
-# collapses that.
+# sanshain-rs's gates. The standard's part comes from paxel/gates: the OSV gate, the Rust gate
+# (format, lint set, clippy, tests, coverage ratchet) and SonarQube Cloud. The job on the
+# oldest supported Rust is the repository's own (docs/adr/0001-move-to-gates.md).
+# A branch gets its run through its pull request; a run per push as well would be the same
+# jobs twice, and SonarQube Cloud analyses only the default branch and pull requests.
 on:
   push:
-    branches: ["**"]
+    branches: [summer]
   pull_request:
 
 concurrency:
-  # head_ref (the branch) for PR events, ref for pushes — so a push to a branch
-  # with an open PR shares one group and the duplicate run is cancelled instead
-  # of building the same commit twice.
-  group: ci-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  group: ci-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
-# The token only reads the code: no job writes to the repository.
-permissions:
-  contents: read
-
 jobs:
-  gate:
-    name: Gate (fmt, clippy, tests)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - name: Format
-        run: cargo fmt --check
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: Tests
-        run: cargo test --workspace --locked
+  # Known vulnerabilities and licences of every dependency: osv-scanner decided by gates'
+  # osv_gate.py. What is accepted stands in osv-scanner.toml.
+  vulns:
+    uses: paxel/gates/.github/workflows/vulns.yml@02a81ad45b815cbed94f9bb6841424a624e8155f # v1.2.0
+
+  # On the Rust release rust-toolchain.toml pins. Linux only: the release ships source, as
+  # crates, and no binary for any system.
+  rust:
+    uses: paxel/gates/.github/workflows/rust.yml@02a81ad45b815cbed94f9bb6841424a624e8155f # v1.2.0
 
   # The README promises this floor, so it is built and tested, not just declared.
   # Keep in sync with `rust-version` in the workspace Cargo.toml.
   msrv:
     name: MSRV (1.89)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@599c45df1a24c1c63ae1129a7e59f46654b8fb66 # 1.89 branch
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # Named explicitly: rust-toolchain.toml would otherwise pick the pinned release.
       - name: Tests
-        run: cargo test --workspace --locked
+        run: cargo +1.89 test --workspace --locked
 
-  # The same audit as the weekly Security workflow, with the same job name, so a
-  # pull request that brings in a vulnerable crate is stopped before the merge.
-  cargo-audit:
-    name: Vulnerable crates (cargo audit)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
-        with:
-          tool: cargo-audit
-      - name: cargo audit
-        run: cargo audit
+  sonar:
+    needs: rust
+    uses: paxel/gates/.github/workflows/sonar.yml@02a81ad45b815cbed94f9bb6841424a624e8155f # v1.2.0
+    secrets:
+      sonar-token: ${{ secrets.SQ_TOKEN }}
